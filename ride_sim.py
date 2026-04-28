@@ -661,6 +661,21 @@ class SharedState:
         self.map_corner   = 0
         self.map_size_pct = 28
 
+        # ── Pacer cube overlay (cube-overlay branch) ──
+        # Wireframe cube drawn on the optical axis at depth = pacer_gap_m metres.
+        # Forward-locked video assumed: cube is always straight ahead.
+        # World convention here: +y up, camera at origin, road plane at y = -camera_height_m.
+        # pacer_height_m is the vertical *offset* from ground-resting (0 = cube on road).
+        self.pacer_visible     = True
+        self.pacer_gap_m       = 5.0    # depth ahead of camera, metres
+        self.pacer_size_m      = 1.0    # cube edge length, metres
+        self.pacer_height_m    = 0.0    # 0 = bottom on road, +Δ lifts cube up
+        self.camera_height_m   = 1.0    # bar-mounted GoPro: ~1 m above road
+        self.tangent_visible   = True   # red wireframe line down the road centre
+        self.video_fov_h_deg   = 115.0  # horizontal FOV of the rectilinear export
+        self._tune_message     = ""     # transient HUD readout after a hotkey adjust
+        self._tune_message_t   = 0.0    # time.monotonic() of last update
+
 
 # ─────────────────────────────────────────────────────────────
 #  Qt signal bridge
@@ -1144,6 +1159,15 @@ class OverlayWidget(QtWidgets.QWidget):
                 "map_corner":   self.state.map_corner,
                 "map_size_pct": self.state.map_size_pct,
                 "ride_start":   self.state.ride_start_time,
+                "pacer_visible":   self.state.pacer_visible,
+                "pacer_gap_m":     self.state.pacer_gap_m,
+                "pacer_size_m":    self.state.pacer_size_m,
+                "pacer_height_m":  self.state.pacer_height_m,
+                "camera_height_m": self.state.camera_height_m,
+                "tangent_visible": self.state.tangent_visible,
+                "fov_h_deg":       self.state.video_fov_h_deg,
+                "tune_msg":        self.state._tune_message,
+                "tune_t":          self.state._tune_message_t,
             }
 
         # Elapsed time
@@ -1251,6 +1275,14 @@ class OverlayWidget(QtWidgets.QWidget):
             p.setBrush(Qt.NoBrush)
             p.drawRect(mx, my, map_sz, map_sz)
 
+        # ── Tangent line + pacer cube ──
+        # Draw the road-tangent reference first so the cube sits visually on top of it.
+        if snap["tangent_visible"]:
+            self._draw_tangent_line(p, w, h, snap)
+        if snap["pacer_visible"]:
+            self._draw_cube(p, w, h, snap)
+        self._draw_tune_msg(p, w, h, snap)
+
         p.end()
 
     def _draw_ghost_bar(self, p, w, h, snap):
@@ -1297,6 +1329,107 @@ class OverlayWidget(QtWidgets.QWidget):
                  self.RIDER_COLOR if gap_m < -5 else self.DIM)
         fm = QtGui.QFontMetrics(f)
         p.drawText(int(x0 + (bw - fm.horizontalAdvance(label))//2), int(y0 + bh + 14), label)
+
+    # ── Pacer cube (cube-overlay branch) ──
+    # Camera convention: +x right, +y up, +z toward viewer (right-handed).
+    # Visible points have z < 0. Forward-locked video = cube on the -z axis.
+
+    PACER_COLOR   = QtGui.QColor(0, 229, 255, 220)
+    TANGENT_COLOR = QtGui.QColor(255, 80,  80, 230)
+
+    def _project(self, x, y, z, w, h, fov_h_deg):
+        """Pinhole projection. Returns (u, v, behind)."""
+        if z >= -0.01:
+            return 0.0, 0.0, True
+        f_px = (w / 2.0) / math.tan(math.radians(fov_h_deg) / 2.0)
+        u = w / 2.0 + f_px * (x / -z)
+        v = h / 2.0 - f_px * (y / -z)
+        return u, v, False
+
+    def _draw_cube(self, p, w, h, snap):
+        gap   = snap["pacer_gap_m"]
+        size  = snap["pacer_size_m"]
+        cam_h = snap["camera_height_m"]
+        # Cube center y: ground-resting + offset. Ground at y=-cam_h, cube half-size = size/2.
+        cy    = -cam_h + size / 2.0 + snap["pacer_height_m"]
+        fov   = snap["fov_h_deg"]
+        if gap < 0.5:
+            return
+        s = size / 2.0
+        cx, cz = 0.0, -gap
+        verts = [
+            (cx + dx, cy + dy, cz + dz)
+            for dx in (-s, s) for dy in (-s, s) for dz in (-s, s)
+        ]
+        # Bit pattern (dx, dy, dz) → index. Edges connect vertices differing in one bit.
+        edges = [(0,1),(0,2),(0,4),(1,3),(1,5),(2,3),(2,6),(3,7),
+                 (4,5),(4,6),(5,7),(6,7)]
+        pts = [self._project(vx, vy, vz, w, h, fov) for (vx, vy, vz) in verts]
+        if all(b for *_, b in pts):
+            return
+        pen = QtGui.QPen(self.PACER_COLOR, 2.0)
+        pen.setCosmetic(True)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        for i, j in edges:
+            ui, vi, bi = pts[i]
+            uj, vj, bj = pts[j]
+            if bi or bj:
+                continue
+            p.drawLine(QtCore.QPointF(ui, vi), QtCore.QPointF(uj, vj))
+
+    def _draw_tangent_line(self, p, w, h, snap):
+        """Red wireframe line on the road plane straight ahead, with distance ticks.
+
+        Diagnostic: this line is camera-locked (uses the same projection as the cube).
+        If the reframed video's forward-lock is good, the line tracks the painted road
+        centre. If it doesn't, that's a signal we need real GPMF camera-pose data to
+        derotate per-frame.
+        """
+        fov   = snap["fov_h_deg"]
+        cam_h = snap["camera_height_m"]
+        y     = -cam_h           # road plane in camera coords
+        near  = 1.0
+        far   = 50.0
+        u_n, v_n, b_n = self._project(0.0, y, -near, w, h, fov)
+        u_f, v_f, b_f = self._project(0.0, y, -far,  w, h, fov)
+        pen = QtGui.QPen(self.TANGENT_COLOR, 2.5)
+        pen.setCosmetic(True)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        if not (b_n or b_f):
+            p.drawLine(QtCore.QPointF(u_n, v_n), QtCore.QPointF(u_f, v_f))
+        # Distance ticks (perpendicular to centreline, on road plane)
+        tick_half = 0.5
+        for dist in (5, 10, 15, 20, 30, 50):
+            u_l, v_l, b_l = self._project(-tick_half, y, -dist, w, h, fov)
+            u_r, v_r, b_r = self._project(+tick_half, y, -dist, w, h, fov)
+            if not (b_l or b_r):
+                p.drawLine(QtCore.QPointF(u_l, v_l), QtCore.QPointF(u_r, v_r))
+
+    def _draw_tune_msg(self, p, w, h, snap):
+        msg = snap.get("tune_msg") or ""
+        t   = snap.get("tune_t") or 0.0
+        if not msg or t <= 0.0:
+            return
+        age = time.monotonic() - t
+        if age > 2.0:
+            return
+        # Solid for 1.5 s, fade out over the next 0.5 s.
+        alpha = 255 if age < 1.5 else int(255 * max(0.0, 1.0 - (age - 1.5) / 0.5))
+        f = QtGui.QFont(UI_FONT, 12, QtGui.QFont.Bold)
+        p.setFont(f)
+        fm = QtGui.QFontMetrics(f)
+        tw = fm.horizontalAdvance(msg)
+        bg = QtGui.QColor(0, 0, 0, min(160, alpha))
+        p.setPen(Qt.NoPen)
+        p.setBrush(bg)
+        pad = 6
+        rx = w - tw - 2 * pad - self.MARGIN
+        ry = self.MARGIN + 30
+        p.drawRoundedRect(QtCore.QRectF(rx, ry, tw + 2 * pad, fm.height() + 4), 6, 6)
+        p.setPen(QtGui.QColor(0, 229, 255, alpha))
+        p.drawText(int(rx + pad), int(ry + fm.ascent() + 2), msg)
 
 
 
@@ -1902,6 +2035,24 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("M"), self).activated.connect(
             self.controls._cycle_map_mode)
 
+        # Pacer cube tuning (cube-overlay branch)
+        QtGui.QShortcut(QtGui.QKeySequence(","), self).activated.connect(
+            lambda: self._tune_pacer("fov", -1.0))
+        QtGui.QShortcut(QtGui.QKeySequence("."), self).activated.connect(
+            lambda: self._tune_pacer("fov", +1.0))
+        QtGui.QShortcut(QtGui.QKeySequence("Shift+,"), self).activated.connect(
+            lambda: self._tune_pacer("fov", -0.1))
+        QtGui.QShortcut(QtGui.QKeySequence("Shift+."), self).activated.connect(
+            lambda: self._tune_pacer("fov", +0.1))
+        QtGui.QShortcut(QtGui.QKeySequence(";"), self).activated.connect(
+            lambda: self._tune_pacer("gap", -0.5))
+        QtGui.QShortcut(QtGui.QKeySequence("'"), self).activated.connect(
+            lambda: self._tune_pacer("gap", +0.5))
+        QtGui.QShortcut(QtGui.QKeySequence("C"), self).activated.connect(
+            self._toggle_pacer)
+        QtGui.QShortcut(QtGui.QKeySequence("R"), self).activated.connect(
+            self._toggle_tangent)
+
         self.statusBar().showMessage("Loading…")
 
         self.timer = QTimer(self)
@@ -1916,6 +2067,33 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = SettingsDialog(self.state, self)
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             dlg.apply_to_state()
+
+    def _tune_pacer(self, axis: str, delta: float):
+        with self.state.lock:
+            if axis == "fov":
+                v = clamp(self.state.video_fov_h_deg + delta, 30.0, 170.0)
+                self.state.video_fov_h_deg = v
+                msg = f"FOV: {v:.1f}°"
+            elif axis == "gap":
+                v = clamp(self.state.pacer_gap_m + delta, 0.5, 100.0)
+                self.state.pacer_gap_m = v
+                msg = f"Gap: {v:.1f} m"
+            else:
+                return
+            self.state._tune_message   = msg
+            self.state._tune_message_t = time.monotonic()
+
+    def _toggle_pacer(self):
+        with self.state.lock:
+            self.state.pacer_visible   = not self.state.pacer_visible
+            self.state._tune_message   = f"Cube: {'ON' if self.state.pacer_visible else 'OFF'}"
+            self.state._tune_message_t = time.monotonic()
+
+    def _toggle_tangent(self):
+        with self.state.lock:
+            self.state.tangent_visible = not self.state.tangent_visible
+            self.state._tune_message   = f"Tangent: {'ON' if self.state.tangent_visible else 'OFF'}"
+            self.state._tune_message_t = time.monotonic()
 
     def _create_overlay_map(self):
         if self._overlay_map is not None:
@@ -2311,6 +2489,12 @@ def main():
 
     state                  = SharedState()
     state.video_offset_sec = cfg["offset"]
+    # Restore persisted pacer cube tunes (cube-overlay branch)
+    state.video_fov_h_deg  = float(last.get("video_fov_h_deg",  state.video_fov_h_deg))
+    state.pacer_gap_m      = float(last.get("pacer_gap_m",      state.pacer_gap_m))
+    state.pacer_visible    = bool(last.get("pacer_visible",     state.pacer_visible))
+    state.camera_height_m  = float(last.get("camera_height_m",  state.camera_height_m))
+    state.tangent_visible  = bool(last.get("tangent_visible",   state.tangent_visible))
     signals                = WorkerSignals()
 
     # ── Activity recording ──
@@ -2339,6 +2523,18 @@ def main():
     win.resize(1440, 900)
     win.show()
     app.exec()
+
+    # Persist runtime tunes (cube-overlay branch)
+    try:
+        runtime = load_settings()
+        runtime["video_fov_h_deg"] = state.video_fov_h_deg
+        runtime["pacer_gap_m"]     = state.pacer_gap_m
+        runtime["pacer_visible"]   = state.pacer_visible
+        runtime["camera_height_m"] = state.camera_height_m
+        runtime["tangent_visible"] = state.tangent_visible
+        save_settings(runtime)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
