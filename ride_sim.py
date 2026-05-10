@@ -825,8 +825,14 @@ async def run_ride_loop(
             signals.request_play.emit()
             is_paused = False
             if pause_started_t_sim is not None:
+                pause_dur = t_sim - pause_started_t_sim
                 with state.lock:
-                    state.ghost_t_offset_s += (t_sim - pause_started_t_sim)
+                    state.ghost_t_offset_s += pause_dur
+                    # Freeze elapsed timer: advance ride_start_time so
+                    # `now - ride_start_time` returns the same value at resume
+                    # as it did at pause start.
+                    if state.ride_start_time is not None:
+                        state.ride_start_time += pause_dur
                 pause_started_t_sim = None
 
         with state.lock:
@@ -865,15 +871,28 @@ async def run_ride_loop(
             signals.request_video_seek.emit(offset + target_route_t)
             with state.lock:
                 state.seek_to_dist_m = -1.0
+                # Bound the trackpoint discontinuity around a scrub: skip
+                # recording for ~2 s past this seek so the TCX has a clear
+                # gap rather than a smooth-looking teleport. Strava/Garmin
+                # handle gaps without crediting the missing distance.
+                state.activity_recorder._last_sample_t = t_sim + 2.0
             last_seek = time.time()
             continue
 
         # While paused, do not advance virtual_dist or send rate updates.
+        # Zero out live telemetry pills (speed/cadence/power) so the HUD
+        # shows the rider isn't pedaling — without this, SIM mode keeps
+        # spinning out non-zero values from the simulated profile and BLE
+        # mode would briefly hold its last-reported values.
         # The ghost worker block below also skips its update so ghost stays
         # frozen at its last position — its effective time is t_sim - offset
         # which keeps drifting, but on resume we'll add the pause duration to
         # the offset so ghost picks up exactly where it left off.
         if is_paused:
+            with state.lock:
+                state.speed_mps_smoothed = 0.0
+                state.cadence_rpm        = 0.0
+                state.power_w            = 0.0
             continue
 
         with state.lock:
@@ -952,15 +971,20 @@ async def run_ride_loop(
             # We use the route arrays passed to the function instead
             pass   # lat/lon recorded via signals below
 
-        with state.lock:
-            rec = state.activity_recorder
-        if rec.enabled:
-            # Interpolate position from dist_m/elev_m arrays
-            _elev = elev_m[ridx] if ridx < len(elev_m) else 0.0
-            rec.record(t_sim, None, None, _elev, virtual_dist,
-                       smoothed, tel.get("cadence_rpm", 0.0),
-                       tel.get("power_w", 0.0),
-                       state.hr_bpm if hr_from_ble else smoothed_hr)
+        # Skip recording while paused: the recorded TCX should reflect only
+        # real pedaling time/distance — paused intervals would inflate total
+        # time and produce flat trackpoints. Combined with the post-seek
+        # _last_sample_t bump in the seek handler, this keeps the recorded
+        # ride honest across both pauses and timeline scrubs.
+        if not is_paused:
+            with state.lock:
+                rec = state.activity_recorder
+            if rec.enabled:
+                _elev = elev_m[ridx] if ridx < len(elev_m) else 0.0
+                rec.record(t_sim, None, None, _elev, virtual_dist,
+                           smoothed, tel.get("cadence_rpm", 0.0),
+                           tel.get("power_w", 0.0),
+                           state.hr_bpm if hr_from_ble else smoothed_hr)
 
         if virtual_dist >= total_dist:
             with state.lock:
