@@ -697,8 +697,13 @@ class SharedState:
         # ghost_t_offset_s: shifts the ghost's effective time so the gap to the
         # rider is preserved across pauses and timeline scrubs. Effective
         # ghost time = t_sim - ghost_t_offset_s.
+        # elapsed_frozen_s: when not None, OverlayWidget uses this for the
+        # elapsed pill instead of (now - ride_start_time). Set on pause-start
+        # so the displayed timer freezes during pause without per-tick aliasing
+        # against the worker's 4 Hz update rate.
         self.user_paused       = False
         self.ghost_t_offset_s  = 0.0
+        self.elapsed_frozen_s  = None
 
         # ── Route geometry (for curve-following tangent dashes) ──
         # lat/lon arrays match dist_m by index. None until main() populates after
@@ -821,6 +826,15 @@ async def run_ride_loop(
             signals.request_pause.emit()
             is_paused = True
             pause_started_t_sim = t_sim
+            with state.lock:
+                # Snapshot elapsed at pause start. OverlayWidget reads this
+                # preferentially while non-None, so the displayed timer
+                # freezes immediately rather than walking with wall clock
+                # until resume.
+                if state.ride_start_time is not None:
+                    state.elapsed_frozen_s = time.time() - state.ride_start_time
+                else:
+                    state.elapsed_frozen_s = 0.0
         elif not should_pause and is_paused:
             signals.request_play.emit()
             is_paused = False
@@ -828,11 +842,12 @@ async def run_ride_loop(
                 pause_dur = t_sim - pause_started_t_sim
                 with state.lock:
                     state.ghost_t_offset_s += pause_dur
-                    # Freeze elapsed timer: advance ride_start_time so
-                    # `now - ride_start_time` returns the same value at resume
-                    # as it did at pause start.
+                    # Advance ride_start_time so post-resume elapsed picks up
+                    # at the frozen value rather than jumping forward by the
+                    # pause duration.
                     if state.ride_start_time is not None:
                         state.ride_start_time += pause_dur
+                    state.elapsed_frozen_s = None
                 pause_started_t_sim = None
 
         with state.lock:
@@ -1262,6 +1277,7 @@ class OverlayWidget(QtWidgets.QWidget):
                 "map_corner":   self.state.map_corner,
                 "map_size_pct": self.state.map_size_pct,
                 "ride_start":   self.state.ride_start_time,
+                "elapsed_frozen_s": self.state.elapsed_frozen_s,
                 "pacer_visible":   self.state.pacer_visible,
                 "pacer_gap_m":     self.state.pacer_gap_m,
                 "pacer_size_m":    self.state.pacer_size_m,
@@ -1278,8 +1294,12 @@ class OverlayWidget(QtWidgets.QWidget):
                 "video_t":         self.state.video_t,
             }
 
-        # Elapsed time
-        if snap["started"] and snap["ride_start"] is not None:
+        # Elapsed time. While paused, the worker stashes a frozen snapshot
+        # in state.elapsed_frozen_s so this pill stops advancing immediately
+        # rather than walking with wall clock until resume.
+        if snap["elapsed_frozen_s"] is not None:
+            snap["elapsed"] = snap["elapsed_frozen_s"]
+        elif snap["started"] and snap["ride_start"] is not None:
             snap["elapsed"] = time.time() - snap["ride_start"]
         else:
             snap["elapsed"] = 0.0
