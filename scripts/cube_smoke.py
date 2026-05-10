@@ -38,13 +38,14 @@ def main() -> None:
     state.speed_mps_smoothed = 5.0
 
     cases = [
-        ("cube_default.png",  dict(pacer_gap_m=5.0,  video_fov_h_deg=115.0)),
-        ("cube_close.png",    dict(pacer_gap_m=2.0,  video_fov_h_deg=115.0)),
-        ("cube_far.png",      dict(pacer_gap_m=15.0, video_fov_h_deg=115.0)),
+        ("cube_default.png",  dict(pacer_gap_m=5.0,  video_fov_h_deg=118.8)),
+        ("cube_close.png",    dict(pacer_gap_m=2.0,  video_fov_h_deg=118.8)),
+        ("cube_far.png",      dict(pacer_gap_m=15.0, video_fov_h_deg=118.8)),
         ("cube_narrow.png",   dict(pacer_gap_m=5.0,  video_fov_h_deg=70.0)),
         ("cube_wide.png",     dict(pacer_gap_m=5.0,  video_fov_h_deg=150.0)),
-        ("cube_lowcam.png",   dict(pacer_gap_m=5.0,  video_fov_h_deg=115.0, camera_height_m=0.5)),
+        ("cube_lowcam.png",   dict(pacer_gap_m=5.0,  video_fov_h_deg=118.8, camera_height_m=0.5)),
     ]
+
     for name, cfg in cases:
         for k, v in cfg.items():
             setattr(state, k, v)

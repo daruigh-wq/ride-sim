@@ -135,9 +135,12 @@ LEAFLET_HTML = r"""<!doctype html>
   const full = L.polyline(route,{weight:3,color:'#444'}).addTo(map);
   map.fitBounds(full.getBounds(),{padding:[15,15]});
   const dot = L.circleMarker(route[0],{radius:8,color:'#ff4444',fillColor:'#ff4444',fillOpacity:1}).addTo(map);
+  const ghost = L.circleMarker(route[0],{radius:7,color:'#ffd54f',fillColor:'#ffd54f',fillOpacity:1,weight:2}).addTo(map);
+  ghost.setStyle({opacity:0,fillOpacity:0});
   let prog = L.polyline([route[0]],{weight:4,color:'#00e5ff',opacity:0.9}).addTo(map);
   window.setPos=function(a,o){dot.setLatLng([a,o]);}
   window.setProgress=function(j){try{prog.setLatLngs(JSON.parse(j));}catch(e){}}
+  window.setGhost=function(a,o,vis){ghost.setLatLng([a,o]);ghost.setStyle({opacity:vis?1:0,fillOpacity:vis?1:0});}
   window._mapReady=true;
 </script>
 </body></html>
@@ -181,10 +184,13 @@ OVERLAY_MAP_HTML = r"""<!doctype html>
   const full = L.polyline(route,{weight:3,color:'#444'}).addTo(map);
   map.fitBounds(full.getBounds(),{padding:[10,10]});
   const dot = L.circleMarker(route[0],{radius:7,color:'#ff4444',fillColor:'#ff4444',fillOpacity:1}).addTo(map);
+  const ghost = L.circleMarker(route[0],{radius:6,color:'#ffd54f',fillColor:'#ffd54f',fillOpacity:1,weight:2}).addTo(map);
+  ghost.setStyle({opacity:0,fillOpacity:0});
   let prog = L.polyline([route[0]],{weight:3,color:'#00e5ff',opacity:0.9}).addTo(map);
 
   window.setPos=function(a,o){dot.setLatLng([a,o]);};
   window.setProgress=function(j){try{prog.setLatLngs(JSON.parse(j));}catch(e){}};
+  window.setGhost=function(a,o,vis){ghost.setLatLng([a,o]);ghost.setStyle({opacity:vis?1:0,fillOpacity:vis?1:0});};
   window.showFullRoute=function(){
     document.getElementById('map').style.transform='none';
     map.invalidateSize();
@@ -672,9 +678,35 @@ class SharedState:
         self.pacer_height_m    = 0.0    # 0 = bottom on road, +Δ lifts cube up
         self.camera_height_m   = 1.0    # bar-mounted GoPro: ~1 m above road
         self.tangent_visible   = True   # red wireframe line down the road centre
-        self.video_fov_h_deg   = 115.0  # horizontal FOV of the rectilinear export
+        # When True AND ghost_active, cube is drawn at ghost_gap_m instead of
+        # pacer_gap_m — turning the cube into a visual proxy for the ghost rider
+        # at the actual gap distance (clamped to [0.5, 100] m).
+        self.cube_follows_ghost = False
+        # Calibrated 2026-05-10 against GS010004 GoPro Player export (Max 2 360 reframe):
+        # central-region effective rectilinear h_fov is 118.81° (angular residual
+        # ~0.5° med within r<0.45 of half-width). Player's POLY projection diverges
+        # past r≈0.45, so cube/tangent geometry should stay near the optical axis.
+        self.video_fov_h_deg   = 118.8
         self._tune_message     = ""     # transient HUD readout after a hotkey adjust
         self._tune_message_t   = 0.0    # time.monotonic() of last update
+
+        # ── User pause + ghost gap preservation ──
+        # user_paused: Space-toggle. When True (or auto-paused for low speed),
+        # the video pauses and the ghost stops advancing. Resume continues both
+        # without ghost having drifted forward.
+        # ghost_t_offset_s: shifts the ghost's effective time so the gap to the
+        # rider is preserved across pauses and timeline scrubs. Effective
+        # ghost time = t_sim - ghost_t_offset_s.
+        self.user_paused       = False
+        self.ghost_t_offset_s  = 0.0
+
+        # ── Route geometry (for curve-following tangent dashes) ──
+        # lat/lon arrays match dist_m by index. None until main() populates after
+        # load_tcx_route. OverlayWidget reads these to render the road centerline
+        # ahead of the rider as a dashed curve through space, not a straight line.
+        self.route_lat_arr     = None    # numpy float array, NaN where missing
+        self.route_lon_arr     = None    # numpy float array, NaN where missing
+        self.route_dist_arr    = None    # numpy float array, cumulative metres
 
 
 # ─────────────────────────────────────────────────────────────
@@ -711,7 +743,12 @@ async def run_ride_loop(
     last_seek        = 0.0
     last_grade_send  = 0.0
     last_grade_value = None
-    video_paused_for_speed = False
+    # Pause state: True iff video is currently paused (auto for low speed OR
+    # user-pause via Space). pause_started_t_sim records when the pause began,
+    # so on resume we can roll ghost_t_offset_s forward by the pause duration
+    # and the ghost picks up exactly where it left off.
+    is_paused             = False
+    pause_started_t_sim   = None
 
     signals.request_pause.emit()
 
@@ -776,19 +813,52 @@ async def run_ride_loop(
             continue
 
         STOP_THRESHOLD_MPS = 0.3
-        if smoothed < STOP_THRESHOLD_MPS:
-            if not video_paused_for_speed:
-                signals.request_pause.emit()
-                video_paused_for_speed = True
-        else:
-            if video_paused_for_speed:
-                signals.request_play.emit()
-                video_paused_for_speed = False
+        with state.lock:
+            user_paused = state.user_paused
+        should_pause = user_paused or (smoothed < STOP_THRESHOLD_MPS)
+
+        if should_pause and not is_paused:
+            signals.request_pause.emit()
+            is_paused = True
+            pause_started_t_sim = t_sim
+        elif not should_pause and is_paused:
+            signals.request_play.emit()
+            is_paused = False
+            if pause_started_t_sim is not None:
+                with state.lock:
+                    state.ghost_t_offset_s += (t_sim - pause_started_t_sim)
+                pause_started_t_sim = None
 
         with state.lock:
             req = state.seek_to_dist_m
         if req >= 0:
-            virtual_dist = clamp(req, 0.0, total_dist)
+            new_virtual = clamp(req, 0.0, total_dist)
+            # Preserve ghost gap across the seek: find the ghost timestamp that
+            # places the ghost at (new_virtual + previous_gap), and update the
+            # ghost-time offset so subsequent ghost lookups produce that point.
+            with state.lock:
+                if (state.ghost_active and state.ghost_time_s is not None
+                        and state.ghost_dist_m_arr is not None):
+                    saved_gap = state.ghost_dist_m - virtual_dist
+                    g_dist_arr = state.ghost_dist_m_arr
+                    g_time_arr = state.ghost_time_s
+                    target_g_dist = clamp(
+                        new_virtual + saved_gap,
+                        float(g_dist_arr[0]),
+                        float(g_dist_arr[-1]),
+                    )
+                    t_ghost_target = interp_time_from_distance(
+                        g_dist_arr, g_time_arr, target_g_dist)
+                    # We want ghost(t_sim - offset) ≈ target_g_dist.
+                    # If currently paused, ghost is frozen at (pause_started_t_sim
+                    # - offset_at_pause_start); use pause_started_t_sim instead
+                    # of t_sim so the ghost stays at the new position when the
+                    # user resumes.
+                    t_ref = (pause_started_t_sim
+                             if (is_paused and pause_started_t_sim is not None)
+                             else t_sim)
+                    state.ghost_t_offset_s = t_ref - t_ghost_target
+            virtual_dist = new_virtual
             target_route_t = interp_time_from_distance(dist_m, time_s, virtual_dist)
             with state.lock:
                 offset = state.video_offset_sec
@@ -796,6 +866,14 @@ async def run_ride_loop(
             with state.lock:
                 state.seek_to_dist_m = -1.0
             last_seek = time.time()
+            continue
+
+        # While paused, do not advance virtual_dist or send rate updates.
+        # The ghost worker block below also skips its update so ghost stays
+        # frozen at its last position — its effective time is t_sim - offset
+        # which keeps drifting, but on resume we'll add the pause duration to
+        # the offset so ghost picks up exactly where it left off.
+        if is_paused:
             continue
 
         with state.lock:
@@ -857,10 +935,11 @@ async def run_ride_loop(
             state.route_index      = ridx
 
             if state.ghost_active and state.ghost_time_s is not None:
+                t_ghost = t_sim - state.ghost_t_offset_s
                 g_dist = interp_dist_from_time(
-                    state.ghost_time_s, state.ghost_dist_m_arr, t_sim)
+                    state.ghost_time_s, state.ghost_dist_m_arr, t_ghost)
                 g_spd  = ghost_speed_at_time(
-                    state.ghost_time_s, state.ghost_dist_m_arr, t_sim)
+                    state.ghost_time_s, state.ghost_dist_m_arr, t_ghost)
                 state.ghost_dist_m    = g_dist
                 state.ghost_speed_mps = g_spd
                 state.ghost_gap_m     = g_dist - virtual_dist
@@ -1165,9 +1244,14 @@ class OverlayWidget(QtWidgets.QWidget):
                 "pacer_height_m":  self.state.pacer_height_m,
                 "camera_height_m": self.state.camera_height_m,
                 "tangent_visible": self.state.tangent_visible,
+                "cube_follows_ghost": self.state.cube_follows_ghost,
+                "route_lat":       self.state.route_lat_arr,
+                "route_lon":       self.state.route_lon_arr,
+                "route_dist":      self.state.route_dist_arr,
                 "fov_h_deg":       self.state.video_fov_h_deg,
                 "tune_msg":        self.state._tune_message,
                 "tune_t":          self.state._tune_message_t,
+                "video_t":         self.state.video_t,
             }
 
         # Elapsed time
@@ -1320,7 +1404,7 @@ class OverlayWidget(QtWidgets.QWidget):
         p.setFont(f)
         if imp:
             gv = gap_m / 1609.344
-            gt = f"{gv:+.2f} mi" if abs(gv) >= 0.1 else f"{gap_m:+.0f} m"
+            gt = f"{gv:+.2f} mi" if abs(gv) >= 0.1 else f"{gap_m * 3.28084:+.0f} ft"
         else:
             gt = f"{gap_m/1000:+.2f} km" if abs(gap_m) >= 1000 else f"{gap_m:+.0f} m"
         direction = "ahead" if gap_m > 0 else "behind"
@@ -1348,20 +1432,24 @@ class OverlayWidget(QtWidgets.QWidget):
 
     def _draw_cube(self, p, w, h, snap):
         gap   = snap["pacer_gap_m"]
+        # In ghost-follow mode, swap in the ghost's gap so the cube *is* the
+        # ghost. Clamp to [0.5, 100] m: at <0.5 m the cube collapses behind the
+        # camera; at >100 m it's a sub-pixel speck.
+        if snap.get("cube_follows_ghost") and snap.get("ghost_active"):
+            gap = max(0.5, min(snap.get("ghost_gap_m") or 0.0, 100.0))
         size  = snap["pacer_size_m"]
         cam_h = snap["camera_height_m"]
-        # Cube center y: ground-resting + offset. Ground at y=-cam_h, cube half-size = size/2.
         cy    = -cam_h + size / 2.0 + snap["pacer_height_m"]
         fov   = snap["fov_h_deg"]
         if gap < 0.5:
             return
         s = size / 2.0
         cx, cz = 0.0, -gap
-        verts = [
-            (cx + dx, cy + dy, cz + dz)
-            for dx in (-s, s) for dy in (-s, s) for dz in (-s, s)
-        ]
-        # Bit pattern (dx, dy, dz) → index. Edges connect vertices differing in one bit.
+        verts = []
+        for dx in (-s, s):
+            for dy in (-s, s):
+                for dz in (-s, s):
+                    verts.append((cx + dx, cy + dy, cz + dz))
         edges = [(0,1),(0,2),(0,4),(1,3),(1,5),(2,3),(2,6),(3,7),
                  (4,5),(4,6),(5,7),(6,7)]
         pts = [self._project(vx, vy, vz, w, h, fov) for (vx, vy, vz) in verts]
@@ -1378,34 +1466,169 @@ class OverlayWidget(QtWidgets.QWidget):
                 continue
             p.drawLine(QtCore.QPointF(ui, vi), QtCore.QPointF(uj, vj))
 
-    def _draw_tangent_line(self, p, w, h, snap):
-        """Red wireframe line on the road plane straight ahead, with distance ticks.
+    # Dashed centreline: dashes are anchored to fixed positions along the
+    # *route* (TCX trackpoints), so they scroll toward the camera as the rider
+    # advances and bend through curves the way the road itself does. If route
+    # geometry isn't loaded, falls back to straight-ahead dashes along the
+    # camera optical axis.
+    DASH_PERIOD_M = 0.6     # distance between dash starts (along route)
+    DASH_LEN_M    = 0.3     # length of each dash (along route)
+    DASH_NEAR_M   = 2.0     # closest dash start, metres ahead of rider
+    DASH_FAR_M    = 50.0    # farthest dash start, metres ahead of rider
 
-        Diagnostic: this line is camera-locked (uses the same projection as the cube).
-        If the reframed video's forward-lock is good, the line tracks the painted road
-        centre. If it doesn't, that's a signal we need real GPMF camera-pose data to
-        derotate per-frame.
+    @staticmethod
+    def _route_xy_at(d_along, route_dist, route_lat, route_lon, lat0, mpd_lat, mpd_lon):
+        """Interpolate (east_m, north_m) on the route at distance d_along (metres
+        along route from start). Returns (east_m, north_m) or (nan, nan) if the
+        endpoints have no fix.
+        """
+        import numpy as _np
+        if d_along <= route_dist[0]:
+            lat = route_lat[0]
+            lon = route_lon[0]
+        elif d_along >= route_dist[-1]:
+            lat = route_lat[-1]
+            lon = route_lon[-1]
+        else:
+            i = int(_np.searchsorted(route_dist, d_along, side="right")) - 1
+            i = max(0, min(i, len(route_dist) - 2))
+            d0, d1 = route_dist[i], route_dist[i + 1]
+            la0, la1 = route_lat[i], route_lat[i + 1]
+            lo0, lo1 = route_lon[i], route_lon[i + 1]
+            if not (math.isfinite(la0) and math.isfinite(la1)
+                    and math.isfinite(lo0) and math.isfinite(lo1)):
+                return float("nan"), float("nan")
+            f = (d_along - d0) / max(d1 - d0, 1e-9)
+            lat = la0 + f * (la1 - la0)
+            lon = lo0 + f * (lo1 - lo0)
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return float("nan"), float("nan")
+        return (lon * mpd_lon), (lat * mpd_lat)  # caller subtracts origin
+
+    def _draw_tangent_line(self, p, w, h, snap):
+        """Dashed red centreline traced along the recorded TCX route, ahead of
+        the rider's current position. Camera-locked rendering — assumes the
+        video stream is forward-stabilized (e.g. GoPro Player export).
         """
         fov   = snap["fov_h_deg"]
         cam_h = snap["camera_height_m"]
-        y     = -cam_h           # road plane in camera coords
-        near  = 1.0
-        far   = 50.0
-        u_n, v_n, b_n = self._project(0.0, y, -near, w, h, fov)
-        u_f, v_f, b_f = self._project(0.0, y, -far,  w, h, fov)
+        y     = -cam_h
+        s_world = float(snap.get("dist") or 0.0)
+
         pen = QtGui.QPen(self.TANGENT_COLOR, 2.5)
         pen.setCosmetic(True)
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
-        if not (b_n or b_f):
-            p.drawLine(QtCore.QPointF(u_n, v_n), QtCore.QPointF(u_f, v_f))
-        # Distance ticks (perpendicular to centreline, on road plane)
+
+        # Static perpendicular ticks at fixed camera-relative depths — a depth
+        # ruler that stays put while the dashes flow past.
+        def proj_camera(wx, wz):
+            return self._project(wx, y, wz, w, h, fov)
+
         tick_half = 0.5
         for dist in (5, 10, 15, 20, 30, 50):
-            u_l, v_l, b_l = self._project(-tick_half, y, -dist, w, h, fov)
-            u_r, v_r, b_r = self._project(+tick_half, y, -dist, w, h, fov)
+            u_l, v_l, b_l = proj_camera(-tick_half, -dist)
+            u_r, v_r, b_r = proj_camera(+tick_half, -dist)
             if not (b_l or b_r):
                 p.drawLine(QtCore.QPointF(u_l, v_l), QtCore.QPointF(u_r, v_r))
+
+        route_dist = snap.get("route_dist")
+        route_lat  = snap.get("route_lat")
+        route_lon  = snap.get("route_lon")
+        if route_dist is None or route_lat is None or route_lon is None:
+            self._draw_tangent_dashes_straight(p, w, h, proj_camera, s_world)
+            return
+        if len(route_dist) < 2:
+            self._draw_tangent_dashes_straight(p, w, h, proj_camera, s_world)
+            return
+
+        import numpy as _np
+        # Rider position + heading via interpolation.
+        s_rider = max(route_dist[0], min(s_world, route_dist[-1]))
+        i_r = int(_np.searchsorted(route_dist, s_rider, side="right")) - 1
+        i_r = max(0, min(i_r, len(route_dist) - 2))
+        f_r = (s_rider - route_dist[i_r]) / max(
+            route_dist[i_r + 1] - route_dist[i_r], 1e-9)
+        lat_r = route_lat[i_r] + f_r * (route_lat[i_r + 1] - route_lat[i_r])
+        lon_r = route_lon[i_r] + f_r * (route_lon[i_r + 1] - route_lon[i_r])
+        if not (math.isfinite(lat_r) and math.isfinite(lon_r)):
+            self._draw_tangent_dashes_straight(p, w, h, proj_camera, s_world)
+            return
+
+        # Heading at rider: bearing computed over a ±2 m window to smooth jitter
+        # from individual GPS samples.
+        s_back = max(route_dist[0], s_rider - 2.0)
+        s_fwd  = min(route_dist[-1], s_rider + 2.0)
+
+        def lat_lon_at(s):
+            i = int(_np.searchsorted(route_dist, s, side="right")) - 1
+            i = max(0, min(i, len(route_dist) - 2))
+            ff = (s - route_dist[i]) / max(route_dist[i + 1] - route_dist[i], 1e-9)
+            return (route_lat[i] + ff * (route_lat[i + 1] - route_lat[i]),
+                    route_lon[i] + ff * (route_lon[i + 1] - route_lon[i]))
+
+        la_b, lo_b = lat_lon_at(s_back)
+        la_f, lo_f = lat_lon_at(s_fwd)
+        if not all(math.isfinite(v) for v in (la_b, lo_b, la_f, lo_f)):
+            self._draw_tangent_dashes_straight(p, w, h, proj_camera, s_world)
+            return
+        lat1 = math.radians(la_b)
+        lat2 = math.radians(la_f)
+        dlon = math.radians(lo_f - lo_b)
+        by = math.sin(dlon) * math.cos(lat2)
+        bx = (math.cos(lat1) * math.sin(lat2)
+              - math.sin(lat1) * math.cos(lat2) * math.cos(dlon))
+        heading = math.atan2(by, bx)  # bearing from north, clockwise
+
+        # Flat-earth metres-per-degree at rider latitude.
+        mpd_lat = 111320.0
+        mpd_lon = 111320.0 * math.cos(math.radians(lat_r))
+
+        def world_to_cam_xz(d_along):
+            la, lo = lat_lon_at(d_along)
+            if not (math.isfinite(la) and math.isfinite(lo)):
+                return None
+            de = (lo - lon_r) * mpd_lon
+            dn = (la - lat_r) * mpd_lat
+            forward = de * math.sin(heading) + dn * math.cos(heading)
+            right   = de * math.cos(heading) - dn * math.sin(heading)
+            return right, -forward  # camera frame: x=right, z=-forward
+
+        # Dashes scroll because their world-distance is fixed; rider's s_rider
+        # advances. Phase the dash grid so it's stable in route coordinates.
+        period = self.DASH_PERIOD_M
+        phase  = s_rider % period
+        d_local = self.DASH_NEAR_M + ((-phase) % period)
+        while d_local <= self.DASH_FAR_M:
+            d_along_a = s_rider + d_local
+            d_along_b = s_rider + d_local + self.DASH_LEN_M
+            if d_along_b > route_dist[-1]:
+                break
+            xz_a = world_to_cam_xz(d_along_a)
+            xz_b = world_to_cam_xz(d_along_b)
+            if xz_a is None or xz_b is None:
+                d_local += period
+                continue
+            ux, uz = xz_a
+            vx, vz = xz_b
+            u0, v0, b0 = self._project(ux, y, uz, w, h, fov)
+            u1, v1, b1 = self._project(vx, y, vz, w, h, fov)
+            if not (b0 or b1):
+                p.drawLine(QtCore.QPointF(u0, v0), QtCore.QPointF(u1, v1))
+            d_local += period
+
+    def _draw_tangent_dashes_straight(self, p, w, h, proj_camera, s_world):
+        """Fallback: straight-ahead dashes if route data isn't available."""
+        period = self.DASH_PERIOD_M
+        phase  = s_world % period
+        d = self.DASH_NEAR_M + ((-phase) % period)
+        while d <= self.DASH_FAR_M:
+            d_far = d + self.DASH_LEN_M
+            u0, v0, b0 = proj_camera(0.0, -d)
+            u1, v1, b1 = proj_camera(0.0, -d_far)
+            if not (b0 or b1):
+                p.drawLine(QtCore.QPointF(u0, v0), QtCore.QPointF(u1, v1))
+            d += period
 
     def _draw_tune_msg(self, p, w, h, snap):
         msg = snap.get("tune_msg") or ""
@@ -1582,6 +1805,11 @@ class MapWidget(QWebEngineView):
             self.page().runJavaScript(
                 f"if(window._mapReady)setProgress({json.dumps(pts)});")
 
+    def set_ghost_position(self, lat, lon, visible: bool):
+        if self._ready:
+            self.page().runJavaScript(
+                f"if(window._mapReady)setGhost({lat},{lon},{'true' if visible else 'false'});")
+
 
 class OverlayMapWidget(QWebEngineView):
     """
@@ -1621,6 +1849,9 @@ class OverlayMapWidget(QWebEngineView):
 
     def set_progress(self, pts):
         self._js(f"setProgress({json.dumps(pts)});")
+
+    def set_ghost_position(self, lat, lon, visible: bool):
+        self._js(f"setGhost({lat},{lon},{'true' if visible else 'false'});")
 
     def show_full_route(self):
         self._js("showFullRoute();")
@@ -2052,6 +2283,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._toggle_pacer)
         QtGui.QShortcut(QtGui.QKeySequence("R"), self).activated.connect(
             self._toggle_tangent)
+        QtGui.QShortcut(QtGui.QKeySequence("G"), self).activated.connect(
+            self._toggle_cube_follows_ghost)
+        # User pause toggle: pauses video AND ghost (gap preserved on resume).
+        QtGui.QShortcut(QtGui.QKeySequence("Space"), self).activated.connect(
+            self._toggle_user_pause)
 
         self.statusBar().showMessage("Loading…")
 
@@ -2083,6 +2319,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.state._tune_message   = msg
             self.state._tune_message_t = time.monotonic()
 
+    def _toggle_user_pause(self):
+        """Space hotkey: toggle user pause. Pauses video AND ghost so the gap
+        is preserved on resume. Worker reads state.user_paused each tick and
+        stops advancing virtual_dist + accumulates ghost_t_offset_s during the
+        pause window."""
+        with self.state.lock:
+            self.state.user_paused = not self.state.user_paused
+            self.state._tune_message   = f"Paused" if self.state.user_paused else "Resumed"
+            self.state._tune_message_t = time.monotonic()
+
     def _toggle_pacer(self):
         with self.state.lock:
             self.state.pacer_visible   = not self.state.pacer_visible
@@ -2093,6 +2339,14 @@ class MainWindow(QtWidgets.QMainWindow):
         with self.state.lock:
             self.state.tangent_visible = not self.state.tangent_visible
             self.state._tune_message   = f"Tangent: {'ON' if self.state.tangent_visible else 'OFF'}"
+            self.state._tune_message_t = time.monotonic()
+
+    def _toggle_cube_follows_ghost(self):
+        with self.state.lock:
+            self.state.cube_follows_ghost = not self.state.cube_follows_ghost
+            self.state._tune_message   = (
+                f"Cube follows ghost: "
+                f"{'ON' if self.state.cube_follows_ghost else 'OFF'}")
             self.state._tune_message_t = time.monotonic()
 
     def _create_overlay_map(self):
@@ -2156,6 +2410,11 @@ class MainWindow(QtWidgets.QMainWindow):
             vdist    = self.state.virtual_dist_m
             map_mode = self.state.map_mode
             imp      = self.state.imperial
+            ghost_active = self.state.ghost_active
+            ghost_gap_m  = self.state.ghost_gap_m
+            route_dist_arr = self.state.route_dist_arr
+            route_lat_arr  = self.state.route_lat_arr
+            route_lon_arr  = self.state.route_lon_arr
 
         parts = [x for x in [ble, hr_st, status] if x]
         self.statusBar().showMessage("   |   ".join(parts))
@@ -2178,6 +2437,33 @@ class MainWindow(QtWidgets.QMainWindow):
             self.map_widget.set_position(cur_lat, cur_lon)
             if self._overlay_map:
                 self._overlay_map.set_position(cur_lat, cur_lon)
+
+        # Ghost rider on the map: interpolate route lat/lon at ghost position.
+        ghost_lat = ghost_lon = None
+        if (ghost_active and route_dist_arr is not None
+                and route_lat_arr is not None and route_lon_arr is not None
+                and len(route_dist_arr) >= 2):
+            import numpy as _np
+            ghost_dist = max(float(route_dist_arr[0]),
+                             min(vdist + ghost_gap_m,
+                                 float(route_dist_arr[-1])))
+            j = int(_np.searchsorted(route_dist_arr, ghost_dist, side="right")) - 1
+            j = max(0, min(j, len(route_dist_arr) - 2))
+            d0 = float(route_dist_arr[j]); d1 = float(route_dist_arr[j + 1])
+            la0 = float(route_lat_arr[j]); la1 = float(route_lat_arr[j + 1])
+            lo0 = float(route_lon_arr[j]); lo1 = float(route_lon_arr[j + 1])
+            if all(math.isfinite(v) for v in (la0, la1, lo0, lo1)):
+                f = (ghost_dist - d0) / max(d1 - d0, 1e-9)
+                ghost_lat = la0 + f * (la1 - la0)
+                ghost_lon = lo0 + f * (lo1 - lo0)
+        if ghost_lat is not None and ghost_lon is not None:
+            self.map_widget.set_ghost_position(ghost_lat, ghost_lon, True)
+            if self._overlay_map:
+                self._overlay_map.set_ghost_position(ghost_lat, ghost_lon, True)
+        else:
+            self.map_widget.set_ghost_position(0.0, 0.0, False)
+            if self._overlay_map:
+                self._overlay_map.set_ghost_position(0.0, 0.0, False)
 
         if ridx - self._last_ridx >= 15 and ridx > 0:
             pts = [[self.lat[k], self.lon[k]]
@@ -2443,6 +2729,7 @@ class StartupDialog(QtWidgets.QDialog):
 
 SETTINGS_FILE = Path.home() / ".ride_sim_settings.json"
 
+
 def load_settings() -> dict:
     try:
         return json.loads(SETTINGS_FILE.read_text())
@@ -2487,14 +2774,24 @@ def main():
     print(f"TCX: {len(time_s)} pts | {dist_m[-1]/1000:.2f} km | "
           f"{time_s[-1]/60:.1f} min | elev {min(elev_m):.0f}–{max(elev_m):.0f} m")
 
+    import numpy as _np
     state                  = SharedState()
     state.video_offset_sec = cfg["offset"]
+    # Stash route geometry for the curved-centerline tangent renderer. NaN-fill
+    # missing lat/lon entries so downstream code can use np.isfinite() masks.
+    _lat_arr = _np.asarray([(v if v is not None else math.nan) for v in lat], dtype=float)
+    _lon_arr = _np.asarray([(v if v is not None else math.nan) for v in lon], dtype=float)
+    state.route_lat_arr  = _lat_arr
+    state.route_lon_arr  = _lon_arr
+    state.route_dist_arr = _np.asarray(dist_m, dtype=float)
     # Restore persisted pacer cube tunes (cube-overlay branch)
     state.video_fov_h_deg  = float(last.get("video_fov_h_deg",  state.video_fov_h_deg))
     state.pacer_gap_m      = float(last.get("pacer_gap_m",      state.pacer_gap_m))
     state.pacer_visible    = bool(last.get("pacer_visible",     state.pacer_visible))
     state.camera_height_m  = float(last.get("camera_height_m",  state.camera_height_m))
     state.tangent_visible  = bool(last.get("tangent_visible",   state.tangent_visible))
+    state.cube_follows_ghost = bool(last.get("cube_follows_ghost",
+                                             state.cube_follows_ghost))
     signals                = WorkerSignals()
 
     # ── Activity recording ──
@@ -2527,11 +2824,12 @@ def main():
     # Persist runtime tunes (cube-overlay branch)
     try:
         runtime = load_settings()
-        runtime["video_fov_h_deg"] = state.video_fov_h_deg
-        runtime["pacer_gap_m"]     = state.pacer_gap_m
-        runtime["pacer_visible"]   = state.pacer_visible
-        runtime["camera_height_m"] = state.camera_height_m
-        runtime["tangent_visible"] = state.tangent_visible
+        runtime["video_fov_h_deg"]         = state.video_fov_h_deg
+        runtime["pacer_gap_m"]             = state.pacer_gap_m
+        runtime["pacer_visible"]           = state.pacer_visible
+        runtime["camera_height_m"]         = state.camera_height_m
+        runtime["tangent_visible"]         = state.tangent_visible
+        runtime["cube_follows_ghost"]      = state.cube_follows_ghost
         save_settings(runtime)
     except Exception:
         pass

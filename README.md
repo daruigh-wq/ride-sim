@@ -82,6 +82,7 @@ Single-file Python application (~2,300 lines). Major components:
 - **macOS audio stutter** — Qt Multimedia's FFmpeg backend flushes audio buffers on `setPlaybackRate()` changes; mitigated by only applying rate changes >1% delta, but some stutter remains at non-1× rates
 - **macOS overlay** — the HUD overlay uses a frameless Tool window positioned over the video (QVideoWidget's native surface renders above child widgets); this works but can occasionally flash during window transitions
 - **Leaflet CDN** — the map requires an internet connection to load tiles from CARTO CDN
+- **Avatar overlay (pacer cube / tangent line) — GoPro Max 2 only** — the projection used for 3D overlay rendering is calibrated for GoPro Player exports of GoPro Max 2 360 footage (effective rectilinear h_fov ≈ 118.8° in the central region). Other cameras and other reframe pipelines use different lens projections; the cube will appear correctly scaled and road-locked only for footage produced by this specific workflow. Off-axis 3D content (e.g., side-passing riders) and slow-speed/handlebar-wobble scenes are limitations of the current data pipeline.
 
 ## License
 
