@@ -88,7 +88,7 @@ If video drifts visibly off telemetry: the in-ride **Video offset** spinner in t
 
 ## Reporting bugs
 
-Inside the app: **F1 → Report an Issue**. The button pre-fills your version number in the issue title. If you don't have a GitHub account, use the **Contact** button instead.
+Inside the app: **F1 → Report an Issue**. The button pre-fills your version number in the issue title. For questions or general feedback (not bugs), use **Discuss / Ask a Question** instead — it opens GitHub Discussions for the project.
 
 When reporting, please include:
 - OS + version

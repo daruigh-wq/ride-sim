@@ -2714,8 +2714,8 @@ class AboutDialog(QtWidgets.QDialog):
         issue_btn.setToolTip("Open the GitHub issue tracker (requires a GitHub account)")
         issue_btn.clicked.connect(self._report_issue)
         frow.addWidget(issue_btn)
-        contact_btn = QtWidgets.QPushButton("Contact")
-        contact_btn.setToolTip("Send feedback via davedesign.com")
+        contact_btn = QtWidgets.QPushButton("Discuss / Ask a Question")
+        contact_btn.setToolTip("Open GitHub Discussions for questions and general feedback")
         contact_btn.clicked.connect(self._contact)
         frow.addWidget(contact_btn)
         frow.addStretch()
@@ -2732,8 +2732,8 @@ class AboutDialog(QtWidgets.QDialog):
         brow.addWidget(ok)
         lay.addLayout(brow)
 
-    REPO_URL    = "https://github.com/daruigh-wq/ride-sim"
-    CONTACT_URL = "https://davedesign.com"
+    REPO_URL        = "https://github.com/daruigh-wq/ride-sim"
+    DISCUSSIONS_URL = "https://github.com/daruigh-wq/ride-sim/discussions"
 
     def _report_issue(self):
         from urllib.parse import quote
@@ -2750,7 +2750,7 @@ class AboutDialog(QtWidgets.QDialog):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
     def _contact(self):
-        QtGui.QDesktopServices.openUrl(QtCore.QUrl(self.CONTACT_URL))
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(self.DISCUSSIONS_URL))
 
     def _open_licenses(self):
         # Locate the licenses file. In a PyInstaller bundle it sits next to
