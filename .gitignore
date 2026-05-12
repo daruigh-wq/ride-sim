@@ -23,8 +23,9 @@ env/
 .DS_Store
 Thumbs.db
 
-# PyInstaller
+# PyInstaller — ignore auto-generated specs but keep our hand-crafted one
 *.spec
+!ride_sim.spec
 
 # Qt
 *.qmlc
