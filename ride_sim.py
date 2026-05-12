@@ -946,7 +946,11 @@ async def run_ride_loop(
             max_r      = state.max_rate
             send_grade = state.send_grade_to_trainer
 
-        if err > HARD_SEEK_SEC and (now - last_seek) > SEEK_COOLDOWN_SEC:
+        if abs(err) > HARD_SEEK_SEC and (now - last_seek) > SEEK_COOLDOWN_SEC:
+            # Symmetric hard-seek: previously this branch only fired when err
+            # was positive (video lagging), so cruise mode (with its gentle
+            # 3% step) could never recover from a video-ahead drift. Negative
+            # err now seeks the video backward to target_video_t.
             signals.request_seek.emit(target_video_t)
             signals.request_rate.emit(base)
             last_seek = now
