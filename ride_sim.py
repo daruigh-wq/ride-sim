@@ -2708,6 +2708,20 @@ class AboutDialog(QtWidgets.QDialog):
         body.setStyleSheet("color: #ddd; font-size: 12px;")
         lay.addWidget(body)
 
+        # Feedback row
+        frow = QtWidgets.QHBoxLayout()
+        issue_btn = QtWidgets.QPushButton("Report an Issue")
+        issue_btn.setToolTip("Open the GitHub issue tracker (requires a GitHub account)")
+        issue_btn.clicked.connect(self._report_issue)
+        frow.addWidget(issue_btn)
+        contact_btn = QtWidgets.QPushButton("Contact")
+        contact_btn.setToolTip("Send feedback via davedesign.com")
+        contact_btn.clicked.connect(self._contact)
+        frow.addWidget(contact_btn)
+        frow.addStretch()
+        lay.addLayout(frow)
+
+        # License row
         brow = QtWidgets.QHBoxLayout()
         lic_btn = QtWidgets.QPushButton("View Third-Party Licenses")
         lic_btn.clicked.connect(self._open_licenses)
@@ -2717,6 +2731,26 @@ class AboutDialog(QtWidgets.QDialog):
         ok.clicked.connect(self.accept)
         brow.addWidget(ok)
         lay.addLayout(brow)
+
+    REPO_URL    = "https://github.com/daruigh-wq/ride-sim"
+    CONTACT_URL = "https://davedesign.com"
+
+    def _report_issue(self):
+        from urllib.parse import quote
+        title = quote(f"Bug in Ride Sim {APP_VERSION}: ")
+        body  = quote(
+            f"Version: {APP_VERSION}\n"
+            f"OS: \n"
+            f"Mode: BLE / SIM\n\n"
+            f"What happened:\n\n"
+            f"What I expected:\n\n"
+            f"Steps to reproduce:\n"
+        )
+        url = f"{self.REPO_URL}/issues/new?labels=bug&title={title}&body={body}"
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    def _contact(self):
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(self.CONTACT_URL))
 
     def _open_licenses(self):
         # Locate the licenses file. In a PyInstaller bundle it sits next to
