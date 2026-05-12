@@ -61,6 +61,14 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 #  TUNING CONSTANTS
 # ─────────────────────────────────────────────────────────────
 
+APP_VERSION          = "0.1.0-beta"
+
+# Beta expiration. Set to a date string "YYYY-MM-DD" at packaging time to
+# disable the bundle after that date; leave as None during development. The
+# check is a courtesy reminder for testers to update — not a security
+# mechanism (any client-side check can be patched out).
+BETA_EXPIRES         = None  # e.g. "2026-09-01"
+
 GATE_START_ON_SPEED  = True
 START_SPEED_KMH      = 2.0
 START_STABLE_SEC     = 1.0
@@ -130,7 +138,7 @@ LEAFLET_HTML = r"""<!doctype html>
   const route = ROUTE_POINTS;
   const map = L.map('map',{zoomControl:false});
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
-    maxZoom:19, attribution:'&copy; OSM &copy; CARTO'
+    maxZoom:19, attribution:'&copy; OpenStreetMap contributors &copy; CARTO'
   }).addTo(map);
   const full = L.polyline(route,{weight:3,color:'#444'}).addTo(map);
   map.fitBounds(full.getBounds(),{padding:[15,15]});
@@ -1004,6 +1012,11 @@ async def run_ride_loop(
         if virtual_dist >= total_dist:
             with state.lock:
                 state.status = "Ride complete! 🎉"
+                # Freeze the elapsed pill at end-of-ride. Without this the
+                # OverlayWidget keeps computing time.time() - ride_start_time
+                # after the worker breaks out of the loop.
+                if state.ride_start_time is not None and state.elapsed_frozen_s is None:
+                    state.elapsed_frozen_s = time.time() - state.ride_start_time
             signals.request_rate.emit(base)
             break
 
@@ -1402,6 +1415,14 @@ class OverlayWidget(QtWidgets.QWidget):
             p.setPen(QtGui.QPen(QtGui.QColor(100, 100, 100, 120), 1))
             p.setBrush(Qt.NoBrush)
             p.drawRect(mx, my, map_sz, map_sz)
+            # OSM/CARTO attribution — required by ODbL §4.3 and CARTO ToS.
+            # The Leaflet attribution control is suppressed on the overlay map
+            # (it would clash with the dark HUD), so render it here in HUD style.
+            attr_font = QtGui.QFont(self.font())
+            attr_font.setPointSize(8)
+            p.setFont(attr_font)
+            p.setPen(QtGui.QColor(200, 200, 200, 200))
+            p.drawText(mx + 4, my + map_sz - 4, "© OpenStreetMap contributors © CARTO")
 
         # ── Tangent line + pacer cube ──
         # Draw the road-tangent reference first so the cube sits visually on top of it.
@@ -1477,10 +1498,14 @@ class OverlayWidget(QtWidgets.QWidget):
     def _draw_cube(self, p, w, h, snap):
         gap   = snap["pacer_gap_m"]
         # In ghost-follow mode, swap in the ghost's gap so the cube *is* the
-        # ghost. Clamp to [0.5, 100] m: at <0.5 m the cube collapses behind the
-        # camera; at >100 m it's a sub-pixel speck.
+        # ghost. Hide if the ghost is alongside or behind the rider
+        # (negative/None gap), and cap the far end at 100 m to avoid sub-pixel
+        # specks.
         if snap.get("cube_follows_ghost") and snap.get("ghost_active"):
-            gap = max(0.5, min(snap.get("ghost_gap_m") or 0.0, 100.0))
+            g = snap.get("ghost_gap_m")
+            if g is None or g < 0.5:
+                return
+            gap = min(g, 100.0)
         size  = snap["pacer_size_m"]
         cam_h = snap["camera_height_m"]
         cy    = -cam_h + size / 2.0 + snap["pacer_height_m"]
@@ -2309,6 +2334,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._exit_fullscreen)
         QtGui.QShortcut(QtGui.QKeySequence("M"), self).activated.connect(
             self.controls._cycle_map_mode)
+        QtGui.QShortcut(QtGui.QKeySequence("F1"), self).activated.connect(
+            lambda: AboutDialog(self).exec())
 
         # Pacer cube tuning (cube-overlay branch)
         QtGui.QShortcut(QtGui.QKeySequence(","), self).activated.connect(
@@ -2646,6 +2673,69 @@ QListWidget::item:selected {{ background: #00a0bb; color: white; }}
 
 
 
+class AboutDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("About Ride Simulator")
+        self.setMinimumWidth(500)
+        self.setStyleSheet(DARK_STYLESHEET)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        title = QtWidgets.QLabel("🚴  Ride Simulator")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #00e5ff;")
+        lay.addWidget(title)
+
+        ver = QtWidgets.QLabel(f"Version {APP_VERSION}")
+        ver.setStyleSheet("color: #aaa;")
+        lay.addWidget(ver)
+
+        body = QtWidgets.QLabel(
+            "Syncs a recorded cycling video to live telemetry from a "
+            "BLE FTMS smart trainer.\n\n"
+            "Built collaboratively with Claude Code (Anthropic).\n\n"
+            "Map data © OpenStreetMap contributors. Tiles © CARTO.\n\n"
+            "GoPro and Max are trademarks of GoPro, Inc., used "
+            "descriptively. This product is not affiliated with or "
+            "endorsed by GoPro, Inc."
+        )
+        body.setWordWrap(True)
+        body.setStyleSheet("color: #ddd; font-size: 12px;")
+        lay.addWidget(body)
+
+        brow = QtWidgets.QHBoxLayout()
+        lic_btn = QtWidgets.QPushButton("View Third-Party Licenses")
+        lic_btn.clicked.connect(self._open_licenses)
+        brow.addWidget(lic_btn)
+        brow.addStretch()
+        ok = QtWidgets.QPushButton("Close")
+        ok.clicked.connect(self.accept)
+        brow.addWidget(ok)
+        lay.addLayout(brow)
+
+    def _open_licenses(self):
+        # Locate the licenses file. In a PyInstaller bundle it sits next to
+        # the executable (or in Contents/Resources on macOS). In a dev run
+        # it sits next to this source file.
+        candidates = []
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).resolve().parent
+            candidates.extend([
+                base / "THIRD_PARTY_LICENSES.txt",
+                base.parent / "Resources" / "THIRD_PARTY_LICENSES.txt",
+            ])
+        candidates.append(Path(__file__).resolve().parent / "THIRD_PARTY_LICENSES.txt")
+        for p in candidates:
+            if p.exists():
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(p)))
+                return
+        QtWidgets.QMessageBox.information(
+            self, "Licenses",
+            "THIRD_PARTY_LICENSES.txt not found alongside the application.",
+        )
+
+
 class StartupDialog(QtWidgets.QDialog):
     def __init__(self, last: dict):
         super().__init__()
@@ -2706,6 +2796,11 @@ class StartupDialog(QtWidgets.QDialog):
         self.mode_combo.currentIndexChanged.connect(_mode_changed)
 
         brow = QtWidgets.QHBoxLayout()
+        about = QtWidgets.QPushButton("About")
+        about.setFlat(True)
+        about.setStyleSheet("color:#888; padding:6px 12px;")
+        about.clicked.connect(lambda: AboutDialog(self).exec())
+        brow.addWidget(about)
         brow.addStretch()
         go = QtWidgets.QPushButton("▶  Start Ride")
         go.setStyleSheet(
@@ -2795,6 +2890,20 @@ def main():
     QtWidgets.QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    if BETA_EXPIRES is not None:
+        try:
+            expires = datetime.strptime(BETA_EXPIRES, "%Y-%m-%d").date()
+            if datetime.now().date() > expires:
+                QtWidgets.QMessageBox.critical(
+                    None,
+                    "Beta expired",
+                    f"This beta build expired on {expires.isoformat()}.\n\n"
+                    f"Please download the latest version.",
+                )
+                return
+        except ValueError:
+            pass  # malformed date — skip check rather than block startup
 
     last     = load_settings()
     dlg      = StartupDialog(last)
