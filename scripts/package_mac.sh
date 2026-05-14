@@ -37,7 +37,13 @@ echo "==> Building ${APP_NAME} ${VERSION} for macOS"
 rm -rf build dist
 pyinstaller ride_sim.spec --clean --noconfirm
 
-rm -f "dist/${DMG_NAME}"
+# Clean up any leftover temp DMG from an interrupted create-dmg run,
+# then restart Finder so its automation backlog doesn't time out the
+# AppleScript that positions icons in the DMG window (a known issue on
+# recent macOS that fails with "AppleEvent timed out. (-1712)").
+rm -f "dist/${DMG_NAME}" "dist/rw."*"${APP_NAME}"*.dmg
+killall Finder 2>/dev/null || true
+
 create-dmg \
   --volname "${APP_NAME}" \
   --window-size 540 360 \
