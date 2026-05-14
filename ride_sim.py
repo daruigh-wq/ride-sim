@@ -67,7 +67,7 @@ APP_VERSION          = "0.1.0-beta"
 # disable the bundle after that date; leave as None during development. The
 # check is a courtesy reminder for testers to update — not a security
 # mechanism (any client-side check can be patched out).
-BETA_EXPIRES         = None  # e.g. "2026-09-01"
+BETA_EXPIRES         = "2026-09-01"  # e.g. "2026-09-01"
 
 GATE_START_ON_SPEED  = True
 START_SPEED_KMH      = 2.0
@@ -2308,8 +2308,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scrub_dist_lbl.setFixedWidth(70)
         scrub_row.addWidget(self._scrub_dist_lbl)
 
-        settings_btn = QtWidgets.QPushButton("⚙")
-        settings_btn.setFixedWidth(32)
+        settings_btn = QtWidgets.QPushButton("⚙ Settings")
+        settings_btn.setFixedWidth(90)
         settings_btn.setToolTip("Settings (HUD, sync, map)")
         settings_btn.clicked.connect(self._open_settings)
         scrub_row.addWidget(settings_btn)
