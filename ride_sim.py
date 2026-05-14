@@ -87,8 +87,6 @@ SOFT_ERR_SEC         = 4.0
 HARD_SEEK_SEC        = 15.0
 SEEK_COOLDOWN_SEC    = 5.0
 CRUISE_STEP_PCT      = 0.03
-CRUISE_STEP_AGGR_PCT = 0.10   # used when |err| > CRUISE_AGGRESSIVE_ERR_SEC
-CRUISE_AGGRESSIVE_ERR_SEC = 8.0
 
 # SYNC_DEBUG: when set in the environment, the ride loop writes a per-tick
 # CSV of sync state to ~/ride_sim_sync_debug_<ts>.csv. Use it to diagnose
@@ -783,6 +781,16 @@ async def run_ride_loop(
 
     t0 = time.time()
 
+    # Cruise mode walks its own playback rate (cruise_rate) iteratively so
+    # it can converge on whatever ratio matches the rider's actual pace,
+    # instead of being clamped to base*(1±step) which capped total
+    # compensation at the single step size. Reset to base whenever the
+    # user changes base or strategy, or after any seek.
+    with state.lock:
+        cruise_rate    = state.base_rate
+        last_base_rate = state.base_rate
+        last_strategy  = state.strategy
+
     sync_dbg_file = None
     sync_dbg_csv  = None
     if SYNC_DEBUG_ENABLED:
@@ -926,6 +934,8 @@ async def run_ride_loop(
                 # gap rather than a smooth-looking teleport. Strava/Garmin
                 # handle gaps without crediting the missing distance.
                 state.activity_recorder._last_sample_t = t_sim + 2.0
+            with state.lock:
+                cruise_rate = state.base_rate
             last_seek = time.time()
             continue
 
@@ -973,32 +983,50 @@ async def run_ride_loop(
             max_r      = state.max_rate
             send_grade = state.send_grade_to_trainer
 
+        # Reset cruise's running rate if the user moved the base slider or
+        # switched strategies — start the new mode from a clean slate so
+        # accumulated drift in a previous mode doesn't carry across.
+        if base != last_base_rate or strategy != last_strategy:
+            cruise_rate    = base
+            last_base_rate = base
+            last_strategy  = strategy
+
         if abs(err) > HARD_SEEK_SEC and (now - last_seek) > SEEK_COOLDOWN_SEC:
-            # Symmetric hard-seek: previously this branch only fired when err
-            # was positive (video lagging), so cruise mode (with its gentle
-            # 3% step) could never recover from a video-ahead drift. Negative
-            # err now seeks the video backward to target_video_t.
+            # Hard-seek for genuine large drift. Symmetric since 4ee7de4 so
+            # cruise mode can recover from negative err. Post-seek, reset
+            # cruise_rate to base so the iterative controller restarts
+            # clean rather than from a stale converged rate.
             signals.request_seek.emit(target_video_t)
             signals.request_rate.emit(base)
-            last_seek = now
-            _dbg_act  = "seek-back" if err < 0 else "seek-fwd"
-            _dbg_rate = base
+            last_seek   = now
+            cruise_rate = base
+            _dbg_act    = "seek-back" if err < 0 else "seek-fwd"
+            _dbg_rate   = base
         else:
             if abs(err) < deadband:
-                new_rate = clamp(base, min_r, max_r)
+                # In deadband: proportional snaps to base (its natural
+                # output for small err); cruise *holds* its accumulated
+                # rate. Snapping cruise back to base every time err
+                # crossed zero was the original failure mode — it forced
+                # err to diverge again whenever rider pace ≠ base.
+                if strategy == "cruise":
+                    new_rate = cruise_rate
+                else:
+                    new_rate = clamp(base, min_r, max_r)
             elif strategy == "proportional":
                 new_rate = clamp(base + kp * err, min_r, max_r)
             else:
-                # Adaptive cruise step: when |err| is large, take bigger
-                # rate jumps so cruise converges fast enough to avoid the
-                # 15s hard-seek (and its visible backward jump in cruise
-                # mode). Inside CRUISE_AGGRESSIVE_ERR_SEC the gentle 3%
-                # step still wins so steady-state is calm.
-                step     = (CRUISE_STEP_AGGR_PCT
-                            if abs(err) > CRUISE_AGGRESSIVE_ERR_SEC
-                            else CRUISE_STEP_PCT)
-                new_rate = clamp(
-                    base * (1.0 + step if err > 0 else 1.0 - step), min_r, max_r)
+                # Iterative cruise: each tick outside deadband multiplies
+                # cruise_rate by (1 ± CRUISE_STEP_PCT). Geometric series
+                # means cruise can converge on any ratio in [min_rate,
+                # max_rate] given enough time — unlike base*(1±step),
+                # which capped total compensation at one step's worth.
+                cruise_rate = clamp(
+                    cruise_rate * (1.0 + CRUISE_STEP_PCT
+                                   if err > 0 else 1.0 - CRUISE_STEP_PCT),
+                    min_r, max_r,
+                )
+                new_rate = cruise_rate
             signals.request_rate.emit(new_rate)
             _dbg_act  = "rate"
             _dbg_rate = new_rate
