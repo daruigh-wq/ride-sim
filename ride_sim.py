@@ -22,6 +22,7 @@ Run:
 """
 
 import asyncio
+import csv
 import json
 import math
 import os
@@ -88,6 +89,15 @@ SEEK_COOLDOWN_SEC    = 5.0
 CRUISE_STEP_PCT      = 0.03
 CRUISE_STEP_AGGR_PCT = 0.10   # used when |err| > CRUISE_AGGRESSIVE_ERR_SEC
 CRUISE_AGGRESSIVE_ERR_SEC = 8.0
+
+# SYNC_DEBUG: when set in the environment, the ride loop writes a per-tick
+# CSV of sync state to ~/ride_sim_sync_debug_<ts>.csv. Use it to diagnose
+# why playback rate or seeks drift over time. Off by default; no cost when
+# disabled.
+SYNC_DEBUG_ENABLED = (
+    os.environ.get("SYNC_DEBUG", "").strip().lower()
+    not in ("", "0", "false", "no", "off")
+)
 
 # SIM speed generator
 SIM_SEED             = 1234
@@ -773,6 +783,21 @@ async def run_ride_loop(
 
     t0 = time.time()
 
+    sync_dbg_file = None
+    sync_dbg_csv  = None
+    if SYNC_DEBUG_ENABLED:
+        ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sync_dbg_path = Path.home() / f"ride_sim_sync_debug_{ts_tag}.csv"
+        sync_dbg_file = open(sync_dbg_path, "w", newline="")
+        sync_dbg_csv  = csv.writer(sync_dbg_file)
+        sync_dbg_csv.writerow([
+            "t_sim", "started", "paused",
+            "video_t", "target_video_t", "err_s",
+            "smoothed_mps", "virtual_dist_m",
+            "strategy", "action", "rate",
+        ])
+        print(f"[SYNC_DEBUG] writing trace to {sync_dbg_path}", flush=True)
+
     while True:
         await asyncio.sleep(DT)
 
@@ -956,6 +981,8 @@ async def run_ride_loop(
             signals.request_seek.emit(target_video_t)
             signals.request_rate.emit(base)
             last_seek = now
+            _dbg_act  = "seek-back" if err < 0 else "seek-fwd"
+            _dbg_rate = base
         else:
             if abs(err) < deadband:
                 new_rate = clamp(base, min_r, max_r)
@@ -973,6 +1000,17 @@ async def run_ride_loop(
                 new_rate = clamp(
                     base * (1.0 + step if err > 0 else 1.0 - step), min_r, max_r)
             signals.request_rate.emit(new_rate)
+            _dbg_act  = "rate"
+            _dbg_rate = new_rate
+
+        if sync_dbg_csv is not None:
+            sync_dbg_csv.writerow([
+                f"{t_sim:.3f}", started, is_paused,
+                f"{video_t:.3f}", f"{target_video_t:.3f}", f"{err:+.3f}",
+                f"{smoothed:.3f}", f"{virtual_dist:.2f}",
+                strategy, _dbg_act, f"{_dbg_rate:.4f}",
+            ])
+            sync_dbg_file.flush()
 
         if ble_client and send_grade:
             if (now - last_grade_send) > 0.5 and (
