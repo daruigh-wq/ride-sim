@@ -3,6 +3,30 @@
 A quick reference for testers. For installation issues or feature requests,
 **Help → Report an Issue** (or press **F1**) inside the app.
 
+## Beta warning — read this first
+
+**This is unsigned, lightly tested beta software. Use at your own risk.**
+
+It works on the author's machines, but it will inevitably have bugs you'll
+hit that haven't surfaced yet. Realistic risks:
+
+- **The app may crash** mid-ride. You'll lose the unrecorded part of
+  whatever session you were running.
+- **Your recorded TCX may have sync glitches** — gaps, bad pacing, or odd
+  average speeds during periods where sync corrected aggressively.
+  Spot-check the file before uploading to Strava / Garmin Connect.
+- **The installer is unsigned.** Windows SmartScreen and macOS Gatekeeper
+  will warn you the first time. The bypass steps below are normal beta
+  workflow, but you should also be the kind of person who only runs
+  unsigned software from sources they trust.
+- **No automatic updates.** When a newer beta drops, you re-download.
+- **This build expires on 2026-09-01.** After that the app refuses to
+  start until you grab a newer one. (This is a courtesy reminder, not
+  DRM — it's there so testers don't keep running stale builds.)
+
+No warranty, express or implied. If something goes wrong: **F1 → Report
+an Issue**. That's the whole point of running the beta.
+
 ## What it does
 
 Ride Simulator plays back a recorded cycling video and adjusts playback rate
@@ -23,15 +47,19 @@ previous TCX recording — and an AR **pacer cube** painted in the video.
 | **A BLE FTMS smart trainer** (BLE mode) | Wahoo Kickr, Tacx Neo, Saris H3, etc. |
 | **Bluetooth-capable computer** | macOS 12+ or Windows 10/11 with built-in or USB BLE. |
 
-## First-time setup
+## Installing
 
 ### macOS
-1. On first launch you'll see a Bluetooth permission prompt. **Allow it** — the app cannot find your trainer otherwise.
-2. If Gatekeeper blocks the unsigned app: right-click the app → **Open** → confirm. (Beta builds aren't code-signed yet.)
+1. Open `Ride Sim-<version>-mac.dmg`. Drag **Ride Sim.app** to the **Applications** folder shortcut shown in the DMG window.
+2. **First launch — Gatekeeper warning.** Open **Applications** in Finder. Double-clicking **Ride Sim** the normal way will show *"Ride Sim cannot be opened because the developer cannot be verified."* with only a **Cancel** button (or **Move to Trash** on newer macOS). Click **Cancel**.
+3. Now **right-click** (or Control-click) **Ride Sim** in Applications → **Open**. The same dialog reappears, but this time it has an **Open** button. Click **Open**. macOS will remember this for all future launches — you only need the right-click dance once.
+4. **Bluetooth permission prompt.** On first run, macOS asks for permission to use Bluetooth. **Allow it** — the app cannot find your trainer otherwise. If you refuse, you can re-enable it in **System Settings → Privacy & Security → Bluetooth**.
 
 ### Windows
-1. Make sure Bluetooth is **on** in Settings → Bluetooth & devices.
-2. If SmartScreen blocks the app: click **More info** → **Run anyway**.
+1. Run `Ride Sim-<version>-windows-setup.exe`.
+2. **First launch — SmartScreen warning.** Windows shows *"Windows protected your PC"* with a default **Don't run** button. Click the small **More info** link near the top of the dialog. The dialog will expand and reveal a **Run anyway** button — click it.
+3. Step through the installer (default install location is fine). When it finishes you'll have a **Ride Sim** entry in the Start Menu and (optionally) a desktop shortcut.
+4. Make sure Bluetooth is **on** in **Settings → Bluetooth & devices**.
 
 ## Connecting to your trainer (BLE mode)
 
