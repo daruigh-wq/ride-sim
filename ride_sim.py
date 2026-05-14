@@ -86,6 +86,8 @@ SOFT_ERR_SEC         = 4.0
 HARD_SEEK_SEC        = 15.0
 SEEK_COOLDOWN_SEC    = 5.0
 CRUISE_STEP_PCT      = 0.03
+CRUISE_STEP_AGGR_PCT = 0.10   # used when |err| > CRUISE_AGGRESSIVE_ERR_SEC
+CRUISE_AGGRESSIVE_ERR_SEC = 8.0
 
 # SIM speed generator
 SIM_SEED             = 1234
@@ -960,7 +962,14 @@ async def run_ride_loop(
             elif strategy == "proportional":
                 new_rate = clamp(base + kp * err, min_r, max_r)
             else:
-                step     = CRUISE_STEP_PCT
+                # Adaptive cruise step: when |err| is large, take bigger
+                # rate jumps so cruise converges fast enough to avoid the
+                # 15s hard-seek (and its visible backward jump in cruise
+                # mode). Inside CRUISE_AGGRESSIVE_ERR_SEC the gentle 3%
+                # step still wins so steady-state is calm.
+                step     = (CRUISE_STEP_AGGR_PCT
+                            if abs(err) > CRUISE_AGGRESSIVE_ERR_SEC
+                            else CRUISE_STEP_PCT)
                 new_rate = clamp(
                     base * (1.0 + step if err > 0 else 1.0 - step), min_r, max_r)
             signals.request_rate.emit(new_rate)
