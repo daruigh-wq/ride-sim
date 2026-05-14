@@ -36,3 +36,23 @@ Thumbs.db
 
 # Recorded activities (user data)
 ride_*.tcx
+
+# Media binaries — videos and GoPro raw should never live in the source repo
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.360
+
+# GoPro-named test footage and yaw-analysis CSVs
+GS*.tcx
+GS*.csv
+
+# Local test clips (mp4 already covered above; this catches the .tcx + .csv)
+test_clip*
+
+# Yaw / FOV calibration experiments — kept locally, not part of the app
+scripts/out/
+scripts/yaw_tune.py
+scripts/curve_smoke.py
+scripts/reframe_360.sh
