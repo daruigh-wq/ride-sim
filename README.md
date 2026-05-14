@@ -86,4 +86,8 @@ Single-file Python application (~2,300 lines). Major components:
 
 ## License
 
-TBD
+Source code in this repository is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — see the full text in `LICENSE`.
+
+In plain English: you can read, build, run, modify, and redistribute this software for **non-commercial** purposes — personal use, hobby projects, education, research, and not-for-profit organizations. Selling the software, including it in a commercial product, or using it as part of a commercial service is **not** permitted under this license. For commercial-use inquiries, open an issue on this repository.
+
+Copyright 2026 David Ruigh. Third-party components (PySide6, bleak, Leaflet.js, etc.) retain their own licenses — see [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt).
