@@ -486,7 +486,7 @@ class ActivityRecorder:
             tp = ET.SubElement(track, f"{{{NS_TCX}}}Trackpoint")
             ts = self._start_time + timedelta(seconds=s["t_sim"])
             ET.SubElement(tp, f"{{{NS_TCX}}}Time").text = \
-                ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+                ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
             if s["lat"] is not None and s["lon"] is not None:
                 pos = ET.SubElement(tp, f"{{{NS_TCX}}}Position")
                 ET.SubElement(pos, f"{{{NS_TCX}}}LatitudeDegrees").text = f"{s['lat']:.7f}"
@@ -498,10 +498,14 @@ class ActivityRecorder:
                 ET.SubElement(hr_el, f"{{{NS_TCX}}}Value").text = str(s["hr"])
             if s["cadence"] > 0:
                 ET.SubElement(tp, f"{{{NS_TCX}}}Cadence").text = str(s["cadence"])
-            if s["power"] > 0:
+            if s["speed_mps"] > 0 or s["power"] > 0:
                 ext = ET.SubElement(tp, f"{{{NS_TCX}}}Extensions")
                 tpx = ET.SubElement(ext, f"{{{NS_AE2}}}TPX")
-                ET.SubElement(tpx, f"{{{NS_AE2}}}Watts").text = str(s["power"])
+                if s["speed_mps"] > 0:
+                    ET.SubElement(tpx, f"{{{NS_AE2}}}Speed").text = \
+                        f"{s['speed_mps']:.3f}"
+                if s["power"] > 0:
+                    ET.SubElement(tpx, f"{{{NS_AE2}}}Watts").text = str(s["power"])
         try:
             ET.indent(root, space="  ")
             ET.ElementTree(root).write(out_path, encoding="unicode",
