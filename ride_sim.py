@@ -82,6 +82,9 @@ HR_ALPHA             = 0.05       # EMA smoothing for simulated HR (slow lag)
 
 GRADE_LOOKAHEAD_M    = 20.0
 GRADE_CLAMP_PCT      = 15.0
+GRADE_ALPHA          = 0.10       # EMA smoothing for grade sent to trainer
+GRADE_SEND_INTERVAL  = 1.0        # seconds between grade writes
+GRADE_SEND_THRESHOLD = 0.5        # only send if |Δgrade| > this (%)
 
 SOFT_ERR_SEC         = 4.0
 HARD_SEEK_SEC        = 15.0
@@ -581,12 +584,6 @@ async def try_set_sim_grade(client: BleakClient, grade_pct: float) -> bool:
     payload   += grade_001.to_bytes(2, "little", signed=True)
     payload   += bytes([0, 0])
     try:
-        try:
-            await client.write_gatt_char(
-                FITNESS_MACHINE_CONTROL_POINT_UUID, bytes([0x00]), response=True)
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
         await client.write_gatt_char(
             FITNESS_MACHINE_CONTROL_POINT_UUID, payload, response=True)
         return True
@@ -768,6 +765,7 @@ async def run_ride_loop(
     last_seek        = 0.0
     last_grade_send  = 0.0
     last_grade_value = None
+    smoothed_grade   = None
     # Pause state: True iff video is currently paused (auto for low speed OR
     # user-pause via Space). pause_started_t_sim records when the pause began,
     # so on resume we can roll ghost_t_offset_s forward by the pause duration
@@ -1012,13 +1010,19 @@ async def run_ride_loop(
             ])
             sync_dbg_file.flush()
 
+        if smoothed_grade is None:
+            smoothed_grade = grade
+        else:
+            smoothed_grade += GRADE_ALPHA * (grade - smoothed_grade)
+
         if ble_client and send_grade:
-            if (now - last_grade_send) > 0.5 and (
-                last_grade_value is None or abs(grade - last_grade_value) > 0.2
+            if (now - last_grade_send) > GRADE_SEND_INTERVAL and (
+                last_grade_value is None
+                or abs(smoothed_grade - last_grade_value) > GRADE_SEND_THRESHOLD
             ):
-                await try_set_sim_grade(ble_client, grade)
+                await try_set_sim_grade(ble_client, smoothed_grade)
                 last_grade_send  = now
-                last_grade_value = grade
+                last_grade_value = smoothed_grade
 
         ridx = find_index_for_distance(dist_m, virtual_dist)
         with state.lock:
