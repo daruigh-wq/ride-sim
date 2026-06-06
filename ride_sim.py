@@ -340,7 +340,28 @@ def load_tcx_route(tcx_path: str):
         raise RuntimeError("Too few trackpoints in TCX file.")
     d0     = dist_m[0]
     dist_m = [d - d0 for d in dist_m]
+    elev_m = _smooth_elev(elev_m, window=5)
     return time_s, dist_m, elev_m, lat, lon
+
+
+def _smooth_elev(elev_m: List[float], window: int = 5) -> List[float]:
+    """Centered boxcar mean over the elevation array.
+
+    GPS/baro elevation has ±0.5-1 m sample-to-sample noise that becomes
+    grade noise when compute_grade_pct takes a finite difference. One
+    pass at load time removes most of it without distorting real climbs
+    (a ~5 m vertical hill is many samples wide).
+    """
+    n = len(elev_m)
+    if n < window or window < 2:
+        return elev_m
+    half = window // 2
+    out  = [0.0] * n
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out[i] = sum(elev_m[lo:hi]) / (hi - lo)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────
@@ -622,6 +643,7 @@ class SharedState:
         self.min_rate             = 0.50
         self.max_rate             = 2.00
         self.send_grade_to_trainer = False
+        self.grade_lookahead_m    = GRADE_LOOKAHEAD_M
         self.video_offset_sec     = 0.0
         self.position_bump_m      = 0.0
         self.video_offset_adj     = 0.0
@@ -687,6 +709,8 @@ class SharedState:
         # Map overlay: corner 0=TR 1=TL 2=BR 3=BL, size_pct=% of video height
         self.map_corner   = 0
         self.map_size_pct = 28
+        # Pill layout: 0 = bottom row (default), 1 = stacked right, 2 = stacked left
+        self.pill_layout  = 0
 
         # ── Pacer cube overlay (cube-overlay branch) ──
         # Wireframe cube drawn on the optical axis at depth = pacer_gap_m metres.
@@ -842,8 +866,10 @@ async def run_ride_loop(
             else:
                 start_ok_since = None
 
+        with state.lock:
+            lookahead = state.grade_lookahead_m
         grade = clamp(
-            compute_grade_pct(dist_m, elev_m, virtual_dist, GRADE_LOOKAHEAD_M),
+            compute_grade_pct(dist_m, elev_m, virtual_dist, lookahead),
             -GRADE_CLAMP_PCT, GRADE_CLAMP_PCT
         )
         with state.lock:
@@ -1347,6 +1373,7 @@ class OverlayWidget(QtWidgets.QWidget):
                 "ghost_name":   self.state.ghost_name,
                 "imperial":     self.state.imperial,
                 "pill_cfg":     list(self.state.hud_pill_cfg),
+                "pill_layout":  self.state.pill_layout,
                 "map_mode":     self.state.map_mode,
                 "map_opacity":  self.state.map_opacity,
                 "map_corner":   self.state.map_corner,
@@ -1400,15 +1427,46 @@ class OverlayWidget(QtWidgets.QWidget):
             p.end()
             return
 
+        pills_cfg = [c for c in snap["pill_cfg"] if c["visible"]]
+        layout    = snap["pill_layout"]   # 0=bottom row, 1=stacked right, 2=stacked left
+
+        # ── Pill positions ──
+        # Compute (px, py, sz) for each visible pill based on layout mode.
+        positions = []
+        if pills_cfg:
+            if layout == 0:
+                total_pw = sum(self.PILL_SIZES[c["size"]]["w"] for c in pills_cfg)
+                total_pw += self.GAP * (len(pills_cfg) - 1)
+                x = (w - total_pw) // 2
+                base_y = h - self.MARGIN
+                for cfg in pills_cfg:
+                    sz = self.PILL_SIZES[cfg["size"]]
+                    positions.append((cfg, x, base_y - sz["h"], sz))
+                    x += sz["w"] + self.GAP
+            else:
+                max_pw = max(self.PILL_SIZES[c["size"]]["w"] for c in pills_cfg)
+                if layout == 1:
+                    x0 = w - self.MARGIN - max_pw
+                else:
+                    x0 = self.MARGIN
+                y = self.MARGIN + 30   # leave room for status / map corner
+                for cfg in pills_cfg:
+                    sz = self.PILL_SIZES[cfg["size"]]
+                    px = x0 + (max_pw - sz["w"])   # right-align in column for layout 1
+                    if layout == 2:
+                        px = x0                    # left-align for layout 2
+                    positions.append((cfg, px, y, sz))
+                    y += sz["h"] + self.GAP
+
         # ── Progress bar ──
         if snap["total"] > 0:
             pct   = snap["dist"] / snap["total"]
             bar_h = 4
-            pills_cfg = [c for c in snap["pill_cfg"] if c["visible"]]
-            # place it just above pills — compute max pill height first
-            max_ph = max((self.PILL_SIZES[c["size"]]["h"] for c in pills_cfg),
-                         default=76)
-            bar_y  = h - max_ph - self.MARGIN - bar_h - 2
+            if layout == 0 and pills_cfg:
+                max_ph = max(self.PILL_SIZES[c["size"]]["h"] for c in pills_cfg)
+                bar_y  = h - max_ph - self.MARGIN - bar_h - 2
+            else:
+                bar_y  = h - self.MARGIN - bar_h
             p.setPen(Qt.NoPen)
             p.setBrush(QtGui.QBrush(QtGui.QColor(40, 40, 60)))
             p.drawRect(0, bar_y, w, bar_h)
@@ -1416,48 +1474,34 @@ class OverlayWidget(QtWidgets.QWidget):
             p.drawRect(0, bar_y, int(w * pct), bar_h)
 
         # ── Pills ──
-        pills_cfg = [c for c in snap["pill_cfg"] if c["visible"]]
-        if pills_cfg:
-            total_pw = sum(self.PILL_SIZES[c["size"]]["w"] for c in pills_cfg)
-            total_pw += self.GAP * (len(pills_cfg) - 1)
-            x0 = (w - total_pw) // 2
-            # align bottoms to MARGIN from bottom
-            max_ph = max(self.PILL_SIZES[c["size"]]["h"] for c in pills_cfg)
-            base_y = h - self.MARGIN
+        for cfg, px, py, sz in positions:
+            pw, ph = sz["w"], sz["h"]
+            rect = QtCore.QRectF(px, py, pw, ph)
 
-            px = x0
-            for cfg in pills_cfg:
-                sz   = self.PILL_SIZES[cfg["size"]]
-                pw, ph = sz["w"], sz["h"]
-                py   = base_y - ph
-                rect = QtCore.QRectF(px, py, pw, ph)
+            lbl_str, val_str, unit_str = self._pill_value(cfg["key"], snap)
+            accent = self._pill_accent(cfg["key"], snap)
 
-                lbl_str, val_str, unit_str = self._pill_value(cfg["key"], snap)
-                accent = self._pill_accent(cfg["key"], snap)
+            p.setBrush(QtGui.QBrush(self.BG))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(rect, sz["r"], sz["r"])
 
-                p.setBrush(QtGui.QBrush(self.BG))
-                p.setPen(Qt.NoPen)
-                p.drawRoundedRect(rect, sz["r"], sz["r"])
+            p.setBrush(QtGui.QBrush(accent))
+            p.drawRect(QtCore.QRectF(px, py, pw, 3))
 
-                p.setBrush(QtGui.QBrush(accent))
-                p.drawRect(QtCore.QRectF(px, py, pw, 3))
+            p.setFont(QtGui.QFont(UI_FONT, sz["lbl"]))
+            p.setPen(self.DIM)
+            p.drawText(QtCore.QRectF(px, py + 4, pw, sz["lbl"] + 4),
+                       Qt.AlignCenter, lbl_str)
 
-                p.setFont(QtGui.QFont(UI_FONT, sz["lbl"]))
-                p.setPen(self.DIM)
-                p.drawText(QtCore.QRectF(px, py + 4, pw, sz["lbl"] + 4),
-                           Qt.AlignCenter, lbl_str)
+            p.setFont(QtGui.QFont(UI_FONT, sz["val"], QtGui.QFont.Bold))
+            p.setPen(self.BRIGHT)
+            p.drawText(QtCore.QRectF(px, py + sz["lbl"] + 6, pw, sz["val"] + 4),
+                       Qt.AlignCenter, val_str)
 
-                p.setFont(QtGui.QFont(UI_FONT, sz["val"], QtGui.QFont.Bold))
-                p.setPen(self.BRIGHT)
-                p.drawText(QtCore.QRectF(px, py + sz["lbl"] + 6, pw, sz["val"] + 4),
-                           Qt.AlignCenter, val_str)
-
-                p.setFont(QtGui.QFont(UI_FONT, sz["unit"]))
-                p.setPen(self.DIM)
-                p.drawText(QtCore.QRectF(px, py + ph - sz["unit"] - 6, pw, sz["unit"] + 4),
-                           Qt.AlignCenter, unit_str)
-
-                px += pw + self.GAP
+            p.setFont(QtGui.QFont(UI_FONT, sz["unit"]))
+            p.setPen(self.DIM)
+            p.drawText(QtCore.QRectF(px, py + ph - sz["unit"] - 6, pw, sz["unit"] + 4),
+                       Qt.AlignCenter, unit_str)
 
         # ── Ghost bar ──
         if snap["ghost_active"]:
@@ -2015,6 +2059,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
         with state.lock:
             pill_cfg    = [dict(c) for c in state.hud_pill_cfg]
+            pill_layout = state.pill_layout
             map_corner  = state.map_corner
             map_size    = state.map_size_pct
             map_opacity = state.map_opacity
@@ -2023,6 +2068,7 @@ class SettingsDialog(QtWidgets.QDialog):
             mnr_i       = int(state.min_rate * 100)
             mxr_i       = int(state.max_rate * 100)
             strategy    = state.strategy
+            lookahead_m = int(state.grade_lookahead_m)
 
         tabs = QtWidgets.QTabWidget()
         lay  = QtWidgets.QVBoxLayout(self)
@@ -2033,9 +2079,18 @@ class SettingsDialog(QtWidgets.QDialog):
         hud_lay = QtWidgets.QVBoxLayout(hud_tab)
         hint = QtWidgets.QLabel(
             "Toggle pills on/off and choose size. "
-            "Drag rows to reorder (left to right on screen).")
+            "Drag rows to reorder (top of list = first on screen).")
         hint.setWordWrap(True)
         hud_lay.addWidget(hint)
+
+        layout_row = QtWidgets.QHBoxLayout()
+        layout_row.addWidget(QtWidgets.QLabel("Layout:"))
+        self._pill_layout_combo = QtWidgets.QComboBox()
+        self._pill_layout_combo.addItems(["Bottom row", "Stacked right", "Stacked left"])
+        self._pill_layout_combo.setCurrentIndex(pill_layout)
+        layout_row.addWidget(self._pill_layout_combo)
+        layout_row.addStretch()
+        hud_lay.addLayout(layout_row)
 
         self._pill_list = QtWidgets.QListWidget()
         self._pill_list.setDragDropMode(QtWidgets.QListWidget.InternalMove)
@@ -2137,6 +2192,34 @@ class SettingsDialog(QtWidgets.QDialog):
         sync_lay.addStretch()
         tabs.addTab(sync_tab, "Sync / PID")
 
+        # ── Tab 4: Trainer (grade computation) ──
+        tr_tab = QtWidgets.QWidget()
+        tr_lay = QtWidgets.QVBoxLayout(tr_tab)
+        tr_hint = QtWidgets.QLabel(
+            "Grade lookahead is the distance ahead of your current "
+            "position used to compute slope (Δelev / Δdistance). "
+            "Smaller = more responsive but noisier; larger = smoother "
+            "but feels delayed on sharp climb starts.")
+        tr_hint.setWordWrap(True)
+        tr_lay.addWidget(tr_hint)
+
+        la_row = QtWidgets.QHBoxLayout()
+        la_lbl = QtWidgets.QLabel("Grade lookahead (m)")
+        la_lbl.setFixedWidth(180)
+        self._la_s = QtWidgets.QSlider(Qt.Horizontal)
+        self._la_s.setRange(5, 100)
+        self._la_s.setValue(lookahead_m)
+        self._la_v = QtWidgets.QLabel(f"{lookahead_m} m")
+        self._la_v.setFixedWidth(70)
+        self._la_v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._la_s.valueChanged.connect(lambda v: self._la_v.setText(f"{v} m"))
+        la_row.addWidget(la_lbl)
+        la_row.addWidget(self._la_s, 1)
+        la_row.addWidget(self._la_v)
+        tr_lay.addLayout(la_row)
+        tr_lay.addStretch()
+        tabs.addTab(tr_tab, "Trainer")
+
         # ── Buttons ──
         btns = QtWidgets.QHBoxLayout()
         btns.addStretch()
@@ -2159,6 +2242,7 @@ class SettingsDialog(QtWidgets.QDialog):
             new_cfg.append({"key": key, "visible": vis.isChecked(), "size": siz.currentIndex()})
         with self.state.lock:
             self.state.hud_pill_cfg  = new_cfg
+            self.state.pill_layout   = self._pill_layout_combo.currentIndex()
             self.state.map_corner    = self._corner_combo.currentIndex()
             self.state.map_size_pct  = self._map_size_s.value()
             self.state.map_opacity   = self._opa_s.value() / 100.0
@@ -2167,6 +2251,7 @@ class SettingsDialog(QtWidgets.QDialog):
             self.state.deadband      = self._dead_s.value()  / 100.0
             self.state.min_rate      = self._minr_s.value()  / 100.0
             self.state.max_rate      = self._maxr_s.value()  / 100.0
+            self.state.grade_lookahead_m = float(self._la_s.value())
 
 
 class ControlsPanel(QtWidgets.QWidget):
