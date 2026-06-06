@@ -783,7 +783,8 @@ async def run_ride_loop(
         state.started = not GATE_START_ON_SPEED
         state.status  = "Running (SIM)" if not GATE_START_ON_SPEED else "Waiting for speed…"
 
-    t0 = time.time()
+    t0       = time.time()
+    last_now = t0
 
     sync_dbg_file = None
     sync_dbg_csv  = None
@@ -807,8 +808,10 @@ async def run_ride_loop(
             if state.stop_event.is_set():
                 break
 
-        now   = time.time()
-        t_sim = now - t0
+        now      = time.time()
+        dt_real  = now - last_now
+        last_now = now
+        t_sim    = now - t0
 
         idx = find_index_for_distance(dist_m, virtual_dist)
         tel = await get_telemetry(t_sim, idx)
@@ -951,7 +954,7 @@ async def run_ride_loop(
             bump = state.position_bump_m
             if bump != 0.0:
                 state.position_bump_m = 0.0
-        virtual_dist = clamp(virtual_dist + smoothed * DT + bump, 0.0, total_dist)
+        virtual_dist = clamp(virtual_dist + smoothed * dt_real + bump, 0.0, total_dist)
 
         target_route_t = interp_time_from_distance(dist_m, time_s, virtual_dist)
         with state.lock:
