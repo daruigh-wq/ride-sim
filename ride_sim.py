@@ -80,7 +80,7 @@ DT                   = 1.0 / CONTROL_HZ
 SPEED_ALPHA          = 0.20       # EMA smoothing for speed
 HR_ALPHA             = 0.05       # EMA smoothing for simulated HR (slow lag)
 
-GRADE_LOOKAHEAD_M    = 20.0
+GRADE_LOOKAHEAD_M    = 12.0
 GRADE_CLAMP_PCT      = 15.0
 GRADE_ALPHA          = 0.10       # EMA smoothing for grade sent to trainer
 GRADE_SEND_INTERVAL  = 1.0        # seconds between grade writes
@@ -340,27 +340,34 @@ def load_tcx_route(tcx_path: str):
         raise RuntimeError("Too few trackpoints in TCX file.")
     d0     = dist_m[0]
     dist_m = [d - d0 for d in dist_m]
-    elev_m = _smooth_elev(elev_m, window=5)
+    elev_m = _smooth_elev(elev_m, dist_m, half_m=30.0)
     return time_s, dist_m, elev_m, lat, lon
 
 
-def _smooth_elev(elev_m: List[float], window: int = 5) -> List[float]:
-    """Centered boxcar mean over the elevation array.
+def _smooth_elev(elev_m: List[float], dist_m: List[float],
+                 half_m: float = 30.0) -> List[float]:
+    """Distance-aware centered boxcar — averages all samples within ±half_m.
 
     GPS/baro elevation has ±0.5-1 m sample-to-sample noise that becomes
-    grade noise when compute_grade_pct takes a finite difference. One
-    pass at load time removes most of it without distorting real climbs
-    (a ~5 m vertical hill is many samples wide).
+    false grade on flat ground when compute_grade_pct takes a finite
+    difference. Smoothing in *metres* (not sample count) removes it
+    independent of how densely the TCX is sampled, and a wide window
+    here lets compute_grade_pct keep a short lookahead — so real dips and
+    climbs (tens of metres wide) survive at full depth while sensor noise
+    is averaged out. See scripts/ride_analysis.py for the tradeoff data.
     """
     n = len(elev_m)
-    if n < window or window < 2:
+    if n < 3:
         return elev_m
-    half = window // 2
-    out  = [0.0] * n
+    out = [0.0] * n
     for i in range(n):
-        lo = max(0, i - half)
-        hi = min(n, i + half + 1)
-        out[i] = sum(elev_m[lo:hi]) / (hi - lo)
+        lo = i
+        while lo > 0 and dist_m[i] - dist_m[lo - 1] <= half_m:
+            lo -= 1
+        hi = i
+        while hi < n - 1 and dist_m[hi + 1] - dist_m[i] <= half_m:
+            hi += 1
+        out[i] = sum(elev_m[lo:hi + 1]) / (hi - lo + 1)
     return out
 
 
