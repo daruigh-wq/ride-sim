@@ -37,6 +37,11 @@ Thumbs.db
 # Recorded activities (user data)
 ride_*.tcx
 
+# Garmin/head-unit exports + ride_analysis.py outputs (local diagnostics)
+activity_*.tcx
+ride_analysis.png
+grade_tradeoff.png
+
 # Media binaries — videos and GoPro raw should never live in the source repo
 *.mp4
 *.mov
