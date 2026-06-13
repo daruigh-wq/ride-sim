@@ -57,6 +57,10 @@ A startup dialog lets you select:
 - **Map Overlay** — corner placement, size %, opacity
 - **Sync / PID** — strategy (cruise/proportional), Kp, deadband, rate limits
 
+## Security note
+
+Video playback decodes through Qt Multimedia's bundled **FFmpeg** backend (`libavcodec`/`libavformat`). FFmpeg's media parsers have a history of memory-safety bugs that can be triggered by deliberately malformed files, so **only open video you trust** — your own ride recordings or footage from sources you control. Don't load video handed to you from unknown or untrusted sources. Keeping PySide6 up to date (`pip install -U PySide6 PySide6-Addons`) picks up Qt's patched FFmpeg builds. TCX route files are parsed by the app's own XML reader, not FFmpeg.
+
 ## Architecture
 
 Single-file Python application (~2,300 lines). Major components:

@@ -27,6 +27,7 @@ import json
 import math
 import os
 import random
+import socket
 import sys
 import threading
 import time
@@ -82,9 +83,21 @@ HR_ALPHA             = 0.05       # EMA smoothing for simulated HR (slow lag)
 
 GRADE_LOOKAHEAD_M    = 12.0
 GRADE_CLAMP_PCT      = 15.0
-GRADE_ALPHA          = 0.10       # EMA smoothing for grade sent to trainer
+GRADE_ALPHA          = 0.25       # EMA smoothing for grade sent to trainer.
+                                  # At 4 Hz this is ~0.9 s time constant (~18 m
+                                  # latch at 20 mph) vs ~2.4 s / ~50 m at 0.10.
+                                  # Upstream elev-smoothing + lookahead already
+                                  # kill grade noise, so the temporal EMA can be
+                                  # fast without the trainer hunting. Cuts the
+                                  # post-crest "still grinding" lag.
 GRADE_SEND_INTERVAL  = 1.0        # seconds between grade writes
 GRADE_SEND_THRESHOLD = 0.5        # only send if |Δgrade| > this (%)
+
+# Stream position/speed to ride-sim-world (the Godot DEM world) over UDP so it
+# can drive its on-rails camera live. Fire-and-forget localhost datagrams; if
+# nothing is listening they're harmless. See ride-sim-world (engine_interface.md).
+WORLD_UDP_ENABLED    = True
+WORLD_UDP_ADDR       = ("127.0.0.1", 5005)
 
 SOFT_ERR_SEC         = 4.0
 HARD_SEEK_SEC        = 15.0
@@ -111,7 +124,7 @@ SIM_DRIFT_PERIOD_SEC = 120.0
 SIM_MIN_SPEED_MPS    = 0.6
 
 # Simulated rider physics (used for power/HR model in SIM mode)
-RIDER_MASS_KG        = 80.0       # rider + bike
+RIDER_MASS_KG        = 83.0       # rider (~73) + gravel bike (~10)
 CRR                  = 0.004      # rolling resistance coefficient
 CD_A                 = 0.35       # drag coefficient × frontal area (m²)
 RHO                  = 1.225      # air density (kg/m³)
@@ -586,13 +599,17 @@ def sim_cadence_rpm(speed_mps: float, grade_pct: float) -> float:
     return clamp(base + random.uniform(-2.0, 2.0), 60.0, 110.0)
 
 
-def make_sim_speed_fn(dist_m, time_s):
+def make_sim_speed_fn(dist_m, time_s, state=None):
     rng = random.Random(SIM_SEED)
     def fn(idx: int, t_sim: float) -> float:
         base  = robust_local_speed(dist_m, time_s, idx)
         drift = SIM_DRIFT_PCT * math.sin(2.0 * math.pi * t_sim / SIM_DRIFT_PERIOD_SEC)
         noise = rng.uniform(-SIM_NOISE_PCT, SIM_NOISE_PCT)
-        return max(SIM_MIN_SPEED_MPS, base * SIM_SPEED_SCALE * (1.0 + drift + noise))
+        scale = SIM_SPEED_SCALE
+        if state is not None:
+            with state.lock:
+                scale *= state.sim_speed_scale
+        return max(SIM_MIN_SPEED_MPS, base * scale * (1.0 + drift + noise))
     return fn
 
 
@@ -655,6 +672,10 @@ class SharedState:
         self.position_bump_m      = 0.0
         self.video_offset_adj     = 0.0
         self.imperial             = False
+        self.video_lock           = False  # world/map mode: stop the video-rate
+                                            # controller so position drives map +
+                                            # UDP world directly (no sync hunting)
+        self.sim_speed_scale      = 1.0    # debug: scale SIM speed (0.25–16×)
 
         # ── Telemetry (worker → GUI) ──
         self.virtual_dist_m       = 0.0
@@ -832,6 +853,27 @@ async def run_ride_loop(
         ])
         print(f"[SYNC_DEBUG] writing trace to {sync_dbg_path}", flush=True)
 
+    # Optional live feed to ride-sim-world. Non-blocking + swallowed errors so a
+    # missing/closed socket can never disturb the ride loop.
+    world_sock = None
+    if WORLD_UDP_ENABLED:
+        try:
+            world_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            world_sock.setblocking(False)
+        except OSError:
+            world_sock = None
+
+    def _emit_world(dist_val, speed_val):
+        if world_sock is None:
+            return
+        try:
+            world_sock.sendto(
+                json.dumps({"distance_m": round(dist_val, 2),
+                            "speed_mps": round(speed_val, 3)}).encode(),
+                WORLD_UDP_ADDR)
+        except OSError:
+            pass
+
     while True:
         await asyncio.sleep(DT)
 
@@ -981,6 +1023,7 @@ async def run_ride_loop(
                 state.speed_mps_smoothed = 0.0
                 state.cadence_rpm        = 0.0
                 state.power_w            = 0.0
+            _emit_world(virtual_dist, 0.0)
             continue
 
         with state.lock:
@@ -995,14 +1038,6 @@ async def run_ride_loop(
         target_video_t = offset + target_route_t
 
         with state.lock:
-            video_t = state.video_t
-
-        if video_t < 0.1:
-            continue
-
-        err = target_video_t - video_t
-
-        with state.lock:
             base       = state.base_rate
             strategy   = state.strategy
             kp         = state.kp
@@ -1010,8 +1045,22 @@ async def run_ride_loop(
             min_r      = state.min_rate
             max_r      = state.max_rate
             send_grade = state.send_grade_to_trainer
+            video_lock = state.video_lock
+            video_t    = state.video_t
 
-        if abs(err) > HARD_SEEK_SEC and (now - last_seek) > SEEK_COOLDOWN_SEC:
+        err = target_video_t - video_t
+
+        if video_lock:
+            # World/map mode: position already drives the map and the UDP world
+            # directly (virtual_dist integration above). Don't run the video-rate
+            # controller — with no route-matched video to sync, it only hunts and
+            # thrashes the screen. Hold the video at base rate; never seek.
+            signals.request_rate.emit(base)
+            _dbg_act  = "locked"
+            _dbg_rate = base
+        elif video_t < 0.1:
+            continue
+        elif abs(err) > HARD_SEEK_SEC and (now - last_seek) > SEEK_COOLDOWN_SEC:
             # Symmetric hard-seek: previously this branch only fired when err
             # was positive (video lagging), so cruise mode (with its gentle
             # 3% step) could never recover from a video-ahead drift. Negative
@@ -1081,6 +1130,8 @@ async def run_ride_loop(
                 state.ghost_speed_mps = g_spd
                 state.ghost_gap_m     = g_dist - virtual_dist
 
+        _emit_world(virtual_dist, smoothed)
+
         # ── Activity recording ──
         # Interpolate lat/lon from route for current position
         rec_lat, rec_lon = None, None
@@ -1115,13 +1166,16 @@ async def run_ride_loop(
             signals.request_rate.emit(base)
             break
 
+    if world_sock is not None:
+        world_sock.close()
+
 
 # ─────────────────────────────────────────────────────────────
 #  SIM worker
 # ─────────────────────────────────────────────────────────────
 
 async def worker_sim(state, signals, time_s, dist_m, elev_m):
-    sim_speed = make_sim_speed_fn(dist_m, time_s)
+    sim_speed = make_sim_speed_fn(dist_m, time_s, state)
 
     async def get_telemetry(t_sim, idx):
         spd = sim_speed(idx, t_sim)
@@ -2304,6 +2358,31 @@ class ControlsPanel(QtWidgets.QWidget):
         pace_row.addWidget(self.base_v)
         root.addLayout(pace_row)
 
+        # Lock to map (world / virtual-world mode): stop the video-rate controller
+        # so position drives the map + UDP world without the sync hunting.
+        self.video_lock_cb = QtWidgets.QCheckBox("Lock to map  (no video sync)")
+        self.video_lock_cb.setToolTip(
+            "World mode: drive the GPS map and the virtual world straight from "
+            "position. The video holds at the pace rate and stops hunting/seeking.")
+        root.addWidget(self.video_lock_cb)
+
+        # Debug SIM-speed slider (0.25–16×), log-mapped. SIM mode only.
+        sim_row = QtWidgets.QHBoxLayout()
+        sim_lbl = QtWidgets.QLabel("SIM speed")
+        sim_lbl.setFixedWidth(120)
+        self.sim_speed_s = QtWidgets.QSlider(Qt.Horizontal)
+        self.sim_speed_s.setRange(0, 100); self.sim_speed_s.setValue(50)  # 50 → 1.0×
+        self.sim_speed_v = QtWidgets.QLabel("1.00×")
+        self.sim_speed_v.setFixedWidth(55)
+        self.sim_speed_v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.sim_speed_s.valueChanged.connect(
+            lambda v: self.sim_speed_v.setText(f"{self._sim_scale_from_slider(v):.2f}×"))
+        self.sim_speed_s.setEnabled(self.sim_mode)
+        sim_lbl.setEnabled(self.sim_mode)
+        sim_row.addWidget(sim_lbl); sim_row.addWidget(self.sim_speed_s, 1)
+        sim_row.addWidget(self.sim_speed_v)
+        root.addLayout(sim_row)
+
         # Map mode cycle button
         map_row = QtWidgets.QHBoxLayout()
         self.map_mode_btn = QtWidgets.QPushButton("🗺 Map: Bottom Panel  (M)")
@@ -2391,11 +2470,22 @@ class ControlsPanel(QtWidgets.QWidget):
             self.state.video_offset_adj = 0.0
         self._vid_offset_lbl.setText("Offset: +0.0 s")
 
+    @staticmethod
+    def _sim_scale_from_slider(v: int) -> float:
+        # Piecewise log map, centered so the default (50) is exactly 1.0×:
+        #   0→0.25×, 50→1.0×, 100→16×.  Lower half spans 0.25–1, upper 1–16.
+        if v <= 50:
+            return 0.25 * (4.0 ** (v / 50.0))
+        return 16.0 ** ((v - 50.0) / 50.0)
+
     def read_into_state(self):
         with self.state.lock:
             self.state.imperial              = self.imperial_cb.isChecked()
             self.state.send_grade_to_trainer = self.send_grade_cb.isChecked()
             self.state.base_rate             = self.base_s.value() / 100.0
+            self.state.video_lock            = self.video_lock_cb.isChecked()
+            self.state.sim_speed_scale       = self._sim_scale_from_slider(
+                self.sim_speed_s.value())
         self.base_v.setText(f"{self.base_s.value()/100:.2f}×")
 
 
