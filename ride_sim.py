@@ -3132,14 +3132,15 @@ class StartupDialog(QtWidgets.QDialog):
 
         # Virtual-world launch (shown only for a Virtual ride). Both optional:
         # if set, ride_sim launches Godot for you; if blank, start Godot yourself.
-        self._godot_bin_row = self._file_row("Godot app:", "*", "godot_bin")
-        self._world_proj_row = self._file_row("World (project.godot):", "project.godot", "world_proj")
-        lay.addWidget(self._godot_bin_row)
-        lay.addWidget(self._world_proj_row)
+        self._world_app_row = self._file_row("World app:", "*", "world_app")
+        self._world_data_row = self._file_row("World data:", "*", "world_data")
+        lay.addWidget(self._world_app_row)
+        lay.addWidget(self._world_data_row)
         self._virtual_hint = QtWidgets.QLabel(
-            "Bake a route with tools/bake_world.py, then point “World” at "
-            "ride-sim-world/godot/project.godot. Leave both blank to launch Godot "
-            "yourself — ride_sim still drives it over UDP.")
+            "World app = the RideSimWorld renderer (e.g. build/RideSimWorld.app). "
+            "World data = a baked world folder from tools/bake_world.py (contains "
+            "world.json). Leave blank to launch the world yourself — ride_sim still "
+            "drives it over UDP.")
         self._virtual_hint.setStyleSheet("color:#555; font-size:10px; margin-left:95px;")
         self._virtual_hint.setWordWrap(True)
         lay.addWidget(self._virtual_hint)
@@ -3203,8 +3204,8 @@ class StartupDialog(QtWidgets.QDialog):
     def _update_world_mode(self):
         virtual = self.world_combo.currentIndex() == 1
         self._video_row.setVisible(not virtual)
-        self._godot_bin_row.setVisible(virtual)
-        self._world_proj_row.setVisible(virtual)
+        self._world_app_row.setVisible(virtual)
+        self._world_data_row.setVisible(virtual)
         self._virtual_hint.setVisible(virtual)
 
     def _file_row(self, label, filt, key):
@@ -3242,11 +3243,15 @@ class StartupDialog(QtWidgets.QDialog):
         if not virtual and (not video or not Path(video).exists()):
             QtWidgets.QMessageBox.warning(self, "Missing", "Please select a valid video file.")
             return
-        godot_bin  = self._godot_bin_edit.text().strip()
-        world_proj = self._world_proj_edit.text().strip()
-        if virtual and world_proj and not Path(world_proj).exists():
+        world_app  = self._world_app_edit.text().strip()
+        world_data = self._world_data_edit.text().strip()
+        if virtual and world_app and not Path(world_app).exists():
             QtWidgets.QMessageBox.warning(
-                self, "Missing", "World project not found — clear it or fix the path.")
+                self, "Missing", "World app not found — clear it or fix the path.")
+            return
+        if virtual and world_data and not Path(world_data).exists():
+            QtWidgets.QMessageBox.warning(
+                self, "Missing", "World data folder not found — clear it or fix the path.")
             return
         ghost = self._ghost_tcx_edit.text().strip()
         if ghost and not Path(ghost).exists():
@@ -3257,8 +3262,8 @@ class StartupDialog(QtWidgets.QDialog):
             "tcx":        tcx,
             "video":      "" if virtual else video,
             "virtual":    virtual,
-            "godot_bin":  godot_bin,
-            "world_proj": world_proj,
+            "world_app":  world_app,
+            "world_data": world_data,
             "offset":     self.offset_spin.value(),
             "sim_mode":   self.mode_combo.currentIndex() == 1,
             "mode_idx":   self.mode_combo.currentIndex(),
@@ -3292,30 +3297,43 @@ def save_settings(d: dict):
 #  Entry point
 # ─────────────────────────────────────────────────────────────
 
-def launch_godot_world(godot_bin: str, world_proj: str):
+def _resolve_app_binary(path: Path) -> Optional[Path]:
+    """Resolve a launchable executable from a path that may be a macOS .app
+    bundle (pick the single executable in Contents/MacOS) or a direct binary."""
+    if path.is_file() and os.access(path, os.X_OK):
+        return path
+    macos = path / "Contents" / "MacOS"
+    if macos.is_dir():
+        for p in macos.iterdir():
+            if p.is_file() and os.access(p, os.X_OK):
+                return p
+    return None
+
+
+def launch_world_renderer(world_app: str, world_data: str):
     """
-    Launch the Godot virtual world for a virtual ride. godot_bin may be the
-    executable or a macOS .app bundle (we resolve to the inner binary). world_proj
-    points at project.godot (we pass its directory via --path). Returns the Popen,
-    or None if not launched (blank paths, or failure — ride_sim still drives any
-    Godot the user starts themselves over UDP).
+    Launch the exported RideSimWorld renderer for a virtual ride and point it at
+    the baked world via the RIDESIM_WORLD_DIR env var (the renderer reads its data
+    from there; see ride-sim-world Main.gd). world_app may be the .app bundle or
+    its inner binary. Returns the Popen, or None if not launched (blank path or
+    failure — ride_sim still drives any renderer the user starts themselves).
     """
-    if not godot_bin or not world_proj:
+    if not world_app:
         return None
-    binp = Path(godot_bin)
-    if binp.suffix == ".app" or binp.is_dir():
-        inner = binp / "Contents" / "MacOS" / "Godot"
-        if inner.exists():
-            binp = inner
-    proj_dir = Path(world_proj)
-    if proj_dir.is_file():
-        proj_dir = proj_dir.parent
+    binp = _resolve_app_binary(Path(world_app))
+    if binp is None:
+        print(f"Could not find an executable in {world_app}; start the world "
+              "yourself — UDP still drives it.")
+        return None
+    env = dict(os.environ)
+    if world_data:
+        env["RIDESIM_WORLD_DIR"] = str(Path(world_data).resolve())
     try:
-        proc = subprocess.Popen([str(binp), "--path", str(proj_dir)])
-        print(f"Launched Godot world: {binp} --path {proj_dir}")
+        proc = subprocess.Popen([str(binp)], env=env)
+        print(f"Launched world renderer: {binp}  RIDESIM_WORLD_DIR={env.get('RIDESIM_WORLD_DIR','(bundled)')}")
         return proc
     except Exception as e:
-        print(f"Could not launch Godot ({e}); start it yourself — UDP still drives it.")
+        print(f"Could not launch world renderer ({e}); start it yourself — UDP still drives it.")
         return None
 
 
@@ -3350,8 +3368,8 @@ def main():
         "mode_idx":   cfg["mode_idx"],
         "ghost_tcx":  cfg.get("ghost_tcx", ""),
         "world_type": 1 if cfg.get("virtual") else 0,
-        "godot_bin":  cfg.get("godot_bin", ""),
-        "world_proj": cfg.get("world_proj", ""),
+        "world_app":  cfg.get("world_app", ""),
+        "world_data": cfg.get("world_data", ""),
     })
 
     try:
@@ -3371,7 +3389,7 @@ def main():
     godot_proc = None
     if cfg.get("virtual"):
         state.video_lock = True
-        godot_proc = launch_godot_world(cfg.get("godot_bin", ""), cfg.get("world_proj", ""))
+        godot_proc = launch_world_renderer(cfg.get("world_app", ""), cfg.get("world_data", ""))
     # Stash route geometry for the curved-centerline tangent renderer. NaN-fill
     # missing lat/lon entries so downstream code can use np.isfinite() masks.
     _lat_arr = _np.asarray([(v if v is not None else math.nan) for v in lat], dtype=float)
