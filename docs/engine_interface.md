@@ -6,6 +6,26 @@
 > Lives here because ride_sim is the producer; the engine work is a separate
 > project track. See the `project-splat-world-track` memory for the why.
 
+## Implemented today (Godot DEM world)
+
+The procedural DEM/OSM world (`ride-sim-world`, Godot 4) already speaks a small
+concrete subset of this contract over UDP JSON-lines on `localhost`:
+
+- **Forward `ride_sim → world` (port 5005):** one JSON object per packet at the
+  ~4 Hz loop tick:
+  `{"distance_m": <m>, "speed_mps": <m/s>[, "ghost_distance_m": <m>]}`.
+  The world snaps to `distance_m` and dead-reckons with `speed_mps` between
+  packets. `ghost_distance_m` is sent only when a ghost is active; the world
+  places the ghost avatar there (else a fixed demo gap). At the finish ride_sim
+  emits `speed_mps = 0` so the world holds still; when paused it emits the frozen
+  distance + 0.
+- **Back-channel `world → ride_sim` (port 5006):** `{"cmd": "toggle_pause"}` —
+  sent when the user presses Space in the Godot window, so pause works from
+  either window. ride_sim flips `user_paused` exactly like its in-app hotkey.
+
+Config: `WORLD_UDP_ADDR` / `WORLD_UDP_RECV_ADDR` in ride_sim.py; `udp_port` /
+`back_port` in Main.gd. The richer versioned schema below is the splat-era target.
+
 ## Core idea
 
 ride_sim is already an **on-rails** experience: telemetry → position along a

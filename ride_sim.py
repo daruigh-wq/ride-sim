@@ -28,6 +28,7 @@ import math
 import os
 import random
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -97,7 +98,8 @@ GRADE_SEND_THRESHOLD = 0.5        # only send if |Δgrade| > this (%)
 # can drive its on-rails camera live. Fire-and-forget localhost datagrams; if
 # nothing is listening they're harmless. See ride-sim-world (engine_interface.md).
 WORLD_UDP_ENABLED    = True
-WORLD_UDP_ADDR       = ("127.0.0.1", 5005)
+WORLD_UDP_ADDR       = ("127.0.0.1", 5005)   # ride_sim → world (distance/speed/ghost)
+WORLD_UDP_RECV_ADDR  = ("127.0.0.1", 5006)   # world → ride_sim (commands, e.g. pause)
 
 SOFT_ERR_SEC         = 4.0
 HARD_SEEK_SEC        = 15.0
@@ -856,23 +858,51 @@ async def run_ride_loop(
     # Optional live feed to ride-sim-world. Non-blocking + swallowed errors so a
     # missing/closed socket can never disturb the ride loop.
     world_sock = None
+    world_recv = None
     if WORLD_UDP_ENABLED:
         try:
             world_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             world_sock.setblocking(False)
         except OSError:
             world_sock = None
+        try:
+            # Back-channel: the world sends commands here (e.g. spacebar pause
+            # from the Godot window). Best-effort — a bind clash just disables it.
+            world_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            world_recv.setblocking(False)
+            world_recv.bind(WORLD_UDP_RECV_ADDR)
+        except OSError:
+            world_recv = None
 
     def _emit_world(dist_val, speed_val):
         if world_sock is None:
             return
+        msg = {"distance_m": round(dist_val, 2), "speed_mps": round(speed_val, 3)}
+        with state.lock:
+            if state.ghost_active and state.ghost_dist_m is not None:
+                msg["ghost_distance_m"] = round(state.ghost_dist_m, 2)
         try:
-            world_sock.sendto(
-                json.dumps({"distance_m": round(dist_val, 2),
-                            "speed_mps": round(speed_val, 3)}).encode(),
-                WORLD_UDP_ADDR)
+            world_sock.sendto(json.dumps(msg).encode(), WORLD_UDP_ADDR)
         except OSError:
             pass
+
+    def _poll_world_commands():
+        # Drain back-channel packets; a "toggle_pause" flips user_paused exactly
+        # like the in-app Space hotkey, so Space works from the Godot window too.
+        if world_recv is None:
+            return
+        while True:
+            try:
+                data, _ = world_recv.recvfrom(512)
+            except OSError:
+                return
+            try:
+                cmd = json.loads(data.decode()).get("cmd")
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if cmd == "toggle_pause":
+                with state.lock:
+                    state.user_paused = not state.user_paused
 
     while True:
         await asyncio.sleep(DT)
@@ -880,6 +910,8 @@ async def run_ride_loop(
         with state.lock:
             if state.stop_event.is_set():
                 break
+
+        _poll_world_commands()
 
         now      = time.time()
         dt_real  = now - last_now
@@ -995,9 +1027,20 @@ async def run_ride_loop(
                              else t_sim)
                     state.ghost_t_offset_s = t_ref - t_ghost_target
             virtual_dist = new_virtual
+            # Re-arm after a user scrub: lift the low-speed auto-pause so seeking
+            # away from the finish (or any stopped tail) starts riding again.
+            # Only the speed term is bumped — an explicit Space pause still holds,
+            # and telemetry takes back over within a tick if the spot is slow.
+            smoothed = max(smoothed, STOP_THRESHOLD_MPS * 3.0)
             target_route_t = interp_time_from_distance(dist_m, time_s, virtual_dist)
             with state.lock:
                 offset = state.video_offset_sec
+                # Publish the scrubbed position now (and push it to the world) so
+                # the map marker / scrubber don't rubber-band back to the old
+                # end value while auto-paused — the seek block returns early,
+                # before the normal state update at the bottom of the loop.
+                state.virtual_dist_m = virtual_dist
+            _emit_world(virtual_dist, 0.0)
             signals.request_video_seek.emit(offset + target_route_t)
             with state.lock:
                 state.seek_to_dist_m = -1.0
@@ -1130,7 +1173,11 @@ async def run_ride_loop(
                 state.ghost_speed_mps = g_spd
                 state.ghost_gap_m     = g_dist - virtual_dist
 
-        _emit_world(virtual_dist, smoothed)
+        # At the finish virtual_dist is clamped at total_dist but `smoothed` is
+        # still non-zero (SIM keeps generating speed); emitting that would make
+        # the world dead-reckon past the end each frame and snap back on every
+        # packet (a 1–2 m forward/back jitter). Emit 0 so the world holds still.
+        _emit_world(virtual_dist, 0.0 if virtual_dist >= total_dist - 0.01 else smoothed)
 
         # ── Activity recording ──
         # Interpolate lat/lon from route for current position
@@ -1158,16 +1205,22 @@ async def run_ride_loop(
         if virtual_dist >= total_dist:
             with state.lock:
                 state.status = "Ride complete! 🎉"
-                # Freeze the elapsed pill at end-of-ride. Without this the
-                # OverlayWidget keeps computing time.time() - ride_start_time
-                # after the worker breaks out of the loop.
+                # Freeze the elapsed pill and zero the live pills at end-of-ride.
                 if state.ride_start_time is not None and state.elapsed_frozen_s is None:
                     state.elapsed_frozen_s = time.time() - state.ride_start_time
+                state.speed_mps_smoothed = 0.0
+                state.cadence_rpm        = 0.0
+                state.power_w            = 0.0
             signals.request_rate.emit(base)
-            break
+            # Don't break out of the loop — keep it alive so a scrub back from the
+            # finish is still processed (the seek block at the top re-arms the
+            # ride). Just hold here without advancing.
+            continue
 
     if world_sock is not None:
         world_sock.close()
+    if world_recv is not None:
+        world_recv.close()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1919,23 +1972,35 @@ class VideoPanel(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ── Video widget ──
-        self.video_widget = QVideoWidget(self)
-        self.video_widget.setAspectRatioMode(Qt.KeepAspectRatio)
-        layout.addWidget(self.video_widget)
+        # ── Video widget / media player, OR a placeholder for a virtual-world ride.
+        # In virtual mode there's no footage — the Godot window is the view — so we
+        # skip the player entirely. _player is None and every player method guards
+        # on it, so the sync signals (which still fire) are harmless no-ops.
+        if video_path:
+            self.video_widget = QVideoWidget(self)
+            self.video_widget.setAspectRatioMode(Qt.KeepAspectRatio)
+            layout.addWidget(self.video_widget)
 
-        # ── Media player ──
-        self._player = QMediaPlayer(self)
-        self._audio  = QAudioOutput(self)
-        self._audio.setVolume(1.0)
-        self._player.setAudioOutput(self._audio)
-        self._player.setVideoOutput(self.video_widget)
-        # Larger buffer reduces audio underruns with Qt Multimedia FFmpeg backend
-        self._player.setSource(QtCore.QUrl.fromLocalFile(str(Path(video_path).resolve())))
-        self._player.pause()
-        self._player.positionChanged.connect(self._on_position)
-        self._player.errorOccurred.connect(
-            lambda err, msg: print(f"[player] {err}: {msg}"))
+            self._player = QMediaPlayer(self)
+            self._audio  = QAudioOutput(self)
+            self._audio.setVolume(1.0)
+            self._player.setAudioOutput(self._audio)
+            self._player.setVideoOutput(self.video_widget)
+            # Larger buffer reduces audio underruns with Qt Multimedia FFmpeg backend
+            self._player.setSource(QtCore.QUrl.fromLocalFile(str(Path(video_path).resolve())))
+            self._player.pause()
+            self._player.positionChanged.connect(self._on_position)
+            self._player.errorOccurred.connect(
+                lambda err, msg: print(f"[player] {err}: {msg}"))
+        else:
+            self._player = None
+            placeholder = QtWidgets.QLabel(
+                "🌐  Virtual world\n\nThe view is in the Godot window.\n"
+                "HUD and map here drive from your position.")
+            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setStyleSheet(
+                "color:#39a07a; font-size:15px; background:#08080d;")
+            layout.addWidget(placeholder)
 
         # ── Overlay: must be a top-level Tool window, not a child widget.
         # QVideoWidget uses a native surface (AVSampleBufferDisplayLayer /
@@ -1961,15 +2026,23 @@ class VideoPanel(QtWidgets.QWidget):
             self.state.video_t = pos_ms / 1000.0
 
     def _play(self):
+        if self._player is None:
+            return
         self._player.play()
 
     def _pause(self):
+        if self._player is None:
+            return
         self._player.pause()
 
     def _seek(self, t_sec: float):
+        if self._player is None:
+            return
         self._player.setPosition(int(t_sec * 1000))
 
     def _set_rate(self, rate: float):
+        if self._player is None:
+            return
         rate = clamp(rate, 0.5, 2.0)
         # Suppress tiny rate changes — Qt Multimedia flushes audio buffers
         # on every setPlaybackRate call, causing ~500ms stutter each time.
@@ -2005,6 +2078,8 @@ class VideoPanel(QtWidgets.QWidget):
 
     def set_aspect_fill(self, fill: bool):
         """fill=True for fullscreen (stretch to 100%), False for windowed (letterbox)."""
+        if self._player is None:
+            return
         mode = Qt.IgnoreAspectRatio if fill else Qt.KeepAspectRatio
         self.video_widget.setAspectRatioMode(mode)
 
@@ -2316,10 +2391,11 @@ class SettingsDialog(QtWidgets.QDialog):
 
 
 class ControlsPanel(QtWidgets.QWidget):
-    def __init__(self, state: SharedState, sim_mode: bool, parent=None):
+    def __init__(self, state: SharedState, sim_mode: bool, virtual: bool = False, parent=None):
         super().__init__(parent)
         self.state    = state
         self.sim_mode = sim_mode
+        self.virtual  = virtual
         self._build()
 
     def _build(self):
@@ -2364,6 +2440,11 @@ class ControlsPanel(QtWidgets.QWidget):
         self.video_lock_cb.setToolTip(
             "World mode: drive the GPS map and the virtual world straight from "
             "position. The video holds at the pace rate and stops hunting/seeking.")
+        if self.virtual:
+            # Virtual ride: map-drive is required (it's what feeds the world over
+            # UDP), so force it on and lock the toggle.
+            self.video_lock_cb.setChecked(True)
+            self.video_lock_cb.setEnabled(False)
         root.addWidget(self.video_lock_cb)
 
         # Debug SIM-speed slider (0.25–16×), log-mapped. SIM mode only.
@@ -2559,7 +2640,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.map_widget = MapWidget(lat, lon)
         brow.addWidget(self.map_widget, stretch=2)
 
-        self.controls = ControlsPanel(state, sim_mode)
+        self.controls = ControlsPanel(state, sim_mode, virtual=not video_path)
         self.controls.setFixedWidth(360)
         brow.addWidget(self.controls)
 
@@ -3032,8 +3113,36 @@ class StartupDialog(QtWidgets.QDialog):
         title.setStyleSheet("font-size: 22px; font-weight: bold; color: #00e5ff;")
         lay.addWidget(title)
 
-        lay.addWidget(self._file_row("TCX file:",   "*.tcx",                     "tcx"))
-        lay.addWidget(self._file_row("Video file:", "*.mp4 *.mkv *.avi *.mov", "video"))
+        # Ride type — your own footage (video) or the generated Godot world.
+        wt_row = QtWidgets.QHBoxLayout()
+        wt_lbl = QtWidgets.QLabel("Ride type:")
+        wt_lbl.setFixedWidth(90)
+        wt_row.addWidget(wt_lbl)
+        self.world_combo = QtWidgets.QComboBox()
+        self.world_combo.addItems(["Video ride (your footage)",
+                                   "Virtual world (Godot)"])
+        self.world_combo.setCurrentIndex(int(self._last.get("world_type", 0)))
+        self.world_combo.currentIndexChanged.connect(self._update_world_mode)
+        wt_row.addWidget(self.world_combo, 1)
+        lay.addLayout(wt_row)
+
+        lay.addWidget(self._file_row("TCX file:", "*.tcx", "tcx"))
+        self._video_row = self._file_row("Video file:", "*.mp4 *.mkv *.avi *.mov", "video")
+        lay.addWidget(self._video_row)
+
+        # Virtual-world launch (shown only for a Virtual ride). Both optional:
+        # if set, ride_sim launches Godot for you; if blank, start Godot yourself.
+        self._godot_bin_row = self._file_row("Godot app:", "*", "godot_bin")
+        self._world_proj_row = self._file_row("World (project.godot):", "project.godot", "world_proj")
+        lay.addWidget(self._godot_bin_row)
+        lay.addWidget(self._world_proj_row)
+        self._virtual_hint = QtWidgets.QLabel(
+            "Bake a route with tools/bake_world.py, then point “World” at "
+            "ride-sim-world/godot/project.godot. Leave both blank to launch Godot "
+            "yourself — ride_sim still drives it over UDP.")
+        self._virtual_hint.setStyleSheet("color:#555; font-size:10px; margin-left:95px;")
+        self._virtual_hint.setWordWrap(True)
+        lay.addWidget(self._virtual_hint)
 
         ghost_row = self._file_row("Ghost TCX:", "*.tcx", "ghost_tcx")
         ghost_hint = QtWidgets.QLabel(
@@ -3089,6 +3198,15 @@ class StartupDialog(QtWidgets.QDialog):
         brow.addWidget(go)
         lay.addLayout(brow)
 
+        self._update_world_mode()
+
+    def _update_world_mode(self):
+        virtual = self.world_combo.currentIndex() == 1
+        self._video_row.setVisible(not virtual)
+        self._godot_bin_row.setVisible(virtual)
+        self._world_proj_row.setVisible(virtual)
+        self._virtual_hint.setVisible(virtual)
+
     def _file_row(self, label, filt, key):
         w   = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(w)
@@ -3115,13 +3233,20 @@ class StartupDialog(QtWidgets.QDialog):
         return w
 
     def _accept(self):
+        virtual = self.world_combo.currentIndex() == 1
         tcx   = self._tcx_edit.text().strip()
         video = self._video_edit.text().strip()
         if not tcx or not Path(tcx).exists():
             QtWidgets.QMessageBox.warning(self, "Missing", "Please select a valid TCX file.")
             return
-        if not video or not Path(video).exists():
+        if not virtual and (not video or not Path(video).exists()):
             QtWidgets.QMessageBox.warning(self, "Missing", "Please select a valid video file.")
+            return
+        godot_bin  = self._godot_bin_edit.text().strip()
+        world_proj = self._world_proj_edit.text().strip()
+        if virtual and world_proj and not Path(world_proj).exists():
+            QtWidgets.QMessageBox.warning(
+                self, "Missing", "World project not found — clear it or fix the path.")
             return
         ghost = self._ghost_tcx_edit.text().strip()
         if ghost and not Path(ghost).exists():
@@ -3129,13 +3254,16 @@ class StartupDialog(QtWidgets.QDialog):
                 self, "Missing", "Ghost TCX file not found — clear it or fix the path.")
             return
         self.result_data = {
-            "tcx":       tcx,
-            "video":     video,
-            "offset":    self.offset_spin.value(),
-            "sim_mode":  self.mode_combo.currentIndex() == 1,
-            "mode_idx":  self.mode_combo.currentIndex(),
-            "ghost_tcx": ghost,
-            "record":    self.record_cb.isChecked(),
+            "tcx":        tcx,
+            "video":      "" if virtual else video,
+            "virtual":    virtual,
+            "godot_bin":  godot_bin,
+            "world_proj": world_proj,
+            "offset":     self.offset_spin.value(),
+            "sim_mode":   self.mode_combo.currentIndex() == 1,
+            "mode_idx":   self.mode_combo.currentIndex(),
+            "ghost_tcx":  ghost,
+            "record":     self.record_cb.isChecked(),
         }
         self.accept()
 
@@ -3164,6 +3292,33 @@ def save_settings(d: dict):
 #  Entry point
 # ─────────────────────────────────────────────────────────────
 
+def launch_godot_world(godot_bin: str, world_proj: str):
+    """
+    Launch the Godot virtual world for a virtual ride. godot_bin may be the
+    executable or a macOS .app bundle (we resolve to the inner binary). world_proj
+    points at project.godot (we pass its directory via --path). Returns the Popen,
+    or None if not launched (blank paths, or failure — ride_sim still drives any
+    Godot the user starts themselves over UDP).
+    """
+    if not godot_bin or not world_proj:
+        return None
+    binp = Path(godot_bin)
+    if binp.suffix == ".app" or binp.is_dir():
+        inner = binp / "Contents" / "MacOS" / "Godot"
+        if inner.exists():
+            binp = inner
+    proj_dir = Path(world_proj)
+    if proj_dir.is_file():
+        proj_dir = proj_dir.parent
+    try:
+        proc = subprocess.Popen([str(binp), "--path", str(proj_dir)])
+        print(f"Launched Godot world: {binp} --path {proj_dir}")
+        return proc
+    except Exception as e:
+        print(f"Could not launch Godot ({e}); start it yourself — UDP still drives it.")
+        return None
+
+
 def main():
     QtWidgets.QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QtWidgets.QApplication(sys.argv)
@@ -3189,11 +3344,14 @@ def main():
         return
     cfg = dlg.result_data
     save_settings({
-        "tcx":       cfg["tcx"],
-        "video":     cfg["video"],
-        "offset":    cfg["offset"],
-        "mode_idx":  cfg["mode_idx"],
-        "ghost_tcx": cfg.get("ghost_tcx", ""),
+        "tcx":        cfg["tcx"],
+        "video":      cfg["video"],
+        "offset":     cfg["offset"],
+        "mode_idx":   cfg["mode_idx"],
+        "ghost_tcx":  cfg.get("ghost_tcx", ""),
+        "world_type": 1 if cfg.get("virtual") else 0,
+        "godot_bin":  cfg.get("godot_bin", ""),
+        "world_proj": cfg.get("world_proj", ""),
     })
 
     try:
@@ -3208,6 +3366,12 @@ def main():
     import numpy as _np
     state                  = SharedState()
     state.video_offset_sec = cfg["offset"]
+    # Virtual-world ride: the Godot world is the view. Force map-drive (no video
+    # controller to hunt) and launch Godot if the user configured its paths.
+    godot_proc = None
+    if cfg.get("virtual"):
+        state.video_lock = True
+        godot_proc = launch_godot_world(cfg.get("godot_bin", ""), cfg.get("world_proj", ""))
     # Stash route geometry for the curved-centerline tangent renderer. NaN-fill
     # missing lat/lon entries so downstream code can use np.isfinite() masks.
     _lat_arr = _np.asarray([(v if v is not None else math.nan) for v in lat], dtype=float)
@@ -3251,6 +3415,10 @@ def main():
     win.resize(1440, 900)
     win.show()
     app.exec()
+
+    # Close the Godot world we launched (if any) when the ride window exits.
+    if godot_proc is not None and godot_proc.poll() is None:
+        godot_proc.terminate()
 
     # Persist runtime tunes (cube-overlay branch)
     try:
