@@ -3132,8 +3132,10 @@ class StartupDialog(QtWidgets.QDialog):
 
         # Virtual-world launch (shown only for a Virtual ride). Both optional:
         # if set, ride_sim launches Godot for you; if blank, start Godot yourself.
-        self._world_app_row = self._file_row("World app:", "*", "world_app")
-        self._world_data_row = self._file_row("World data:", "*", "world_data")
+        self._world_app_row = self._file_row(
+            "World app:", "macOS app (*.app);;All files (*)", "world_app")
+        self._world_data_row = self._file_row(
+            "World data:", "", "world_data", directory=True)
         lay.addWidget(self._world_app_row)
         lay.addWidget(self._world_data_row)
         self._virtual_hint = QtWidgets.QLabel(
@@ -3208,7 +3210,7 @@ class StartupDialog(QtWidgets.QDialog):
         self._world_data_row.setVisible(virtual)
         self._virtual_hint.setVisible(virtual)
 
-    def _file_row(self, label, filt, key):
+    def _file_row(self, label, filt, key, directory=False):
         w   = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(w)
         row.setContentsMargins(0, 0, 0, 0)
@@ -3216,14 +3218,17 @@ class StartupDialog(QtWidgets.QDialog):
         lbl.setFixedWidth(90)
         edit = QtWidgets.QLineEdit()
         edit.setText(self._last.get(key, ""))
-        edit.setPlaceholderText("Browse or paste path…")
+        edit.setPlaceholderText("Browse a folder…" if directory else "Browse or paste path…")
         setattr(self, f"_{key}_edit", edit)
         btn = QtWidgets.QPushButton("Browse…")
         btn.setFixedWidth(80)
 
         def browse():
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, f"Select {label}", "", filt)
+            if directory:
+                path = QtWidgets.QFileDialog.getExistingDirectory(self, f"Select {label}", "")
+            else:
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self, f"Select {label}", "", filt)
             if path:
                 edit.setText(path)
 
