@@ -77,6 +77,25 @@ def find_bake_tool() -> Optional[Path]:
             return c
     return None
 
+
+def find_world_app() -> Optional[Path]:
+    """Locate the Godot world renderer — bundled inside the app (frozen) or the
+    dev sibling export at ride-sim-world/build."""
+    for c in (_here / "world" / "RideSimWorld.app",
+              _here.parent / "ride-sim-world" / "build" / "RideSimWorld.app"):
+        if c.exists():
+            return c
+    return None
+
+
+def py_tool_cmd(tool_path) -> list:
+    """Command prefix to run a bundled .py tool. Frozen, sys.executable is this app
+    (not a python), so re-exec it via the --run-pyfile dispatch in main(); in dev
+    it's the real python."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--run-pyfile", str(tool_path)]
+    return [sys.executable, str(tool_path)]
+
 from bleak import BleakClient, BleakScanner
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -3197,17 +3216,22 @@ class BakeWorldDialog(QtWidgets.QDialog):
             return
         self._out_dir = worlds_dir() / Path(self._route).stem
         self._out_dir.mkdir(parents=True, exist_ok=True)
-        args = [str(self._bake_tool), self._route,
-                "--out-dir", str(self._out_dir), "--avg", str(self._avg.value())]
+        cmd = py_tool_cmd(self._bake_tool) + [
+            self._route, "--out-dir", str(self._out_dir), "--avg", str(self._avg.value())]
         if self._reverse.isChecked():
-            args.append("--reverse")
+            cmd.append("--reverse")
         self._bake_btn.setEnabled(False)
         self._log.clear(); self._bar.setValue(0)
         self._proc = QtCore.QProcess(self)
         self._proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        # Frozen: bake_world's own sub-tool calls must use the same re-exec shim.
+        if getattr(sys, "frozen", False):
+            env = QtCore.QProcessEnvironment.systemEnvironment()
+            env.insert("RIDESIM_PY_RUNNER", "frozen")
+            self._proc.setProcessEnvironment(env)
         self._proc.readyReadStandardOutput.connect(self._on_output)
         self._proc.finished.connect(self._on_finished)
-        self._proc.start(sys.executable, args)
+        self._proc.start(cmd[0], cmd[1:])
 
     def _on_output(self):
         data = bytes(self._proc.readAllStandardOutput()).decode(errors="replace")
@@ -3284,6 +3308,11 @@ class StartupDialog(QtWidgets.QDialog):
             "World app:", "macOS app (*.app);;All files (*)", "world_app")
         self._world_data_row = self._file_row(
             "World data:", "", "world_data", directory=True)
+        # Auto-fill the renderer if we can find it (bundled, or the dev export).
+        if not self._world_app_edit.text():
+            wa = find_world_app()
+            if wa is not None:
+                self._world_app_edit.setText(str(wa))
         lay.addWidget(self._world_app_row)
         lay.addWidget(self._world_data_row)
 
@@ -3500,7 +3529,10 @@ def launch_world_renderer(world_app: str, world_data: str):
     failure — ride_sim still drives any renderer the user starts themselves).
     """
     if not world_app:
-        return None
+        found = find_world_app()
+        if found is None:
+            return None
+        world_app = str(found)
     binp = _resolve_app_binary(Path(world_app))
     if binp is None:
         print(f"Could not find an executable in {world_app}; start the world "
@@ -3519,6 +3551,17 @@ def launch_world_renderer(world_app: str, world_data: str):
 
 
 def main():
+    # Frozen tool-runner: the bake pipeline shells out to `sys.executable <tool>.py`,
+    # but in a PyInstaller bundle sys.executable is this app, not a python. When
+    # invoked as `RideSim --run-pyfile <script> [args]` we re-exec the bundled script
+    # via runpy and exit, so the same app doubles as the python for the tools.
+    if getattr(sys, "frozen", False) and len(sys.argv) >= 3 and sys.argv[1] == "--run-pyfile":
+        import runpy
+        script = sys.argv[2]
+        sys.argv = [script] + sys.argv[3:]
+        runpy.run_path(script, run_name="__main__")
+        return
+
     QtWidgets.QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
