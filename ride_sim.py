@@ -3509,14 +3509,22 @@ def save_settings(d: dict):
 
 def _resolve_app_binary(path: Path) -> Optional[Path]:
     """Resolve a launchable executable from a path that may be a macOS .app
-    bundle (pick the single executable in Contents/MacOS) or a direct binary."""
-    if path.is_file() and os.access(path, os.X_OK):
-        return path
+    bundle (the binary in Contents/MacOS) or a direct binary. Ensures the
+    executable bit is set — PyInstaller can drop +x when it copies the nested
+    renderer .app as bundled data."""
+    def _exec(p: Path) -> Path:
+        try:
+            os.chmod(p, 0o755)
+        except OSError:
+            pass
+        return p
+    if path.is_file():
+        return _exec(path)
     macos = path / "Contents" / "MacOS"
     if macos.is_dir():
-        for p in macos.iterdir():
-            if p.is_file() and os.access(p, os.X_OK):
-                return p
+        for p in sorted(macos.iterdir()):
+            if p.is_file():
+                return _exec(p)
     return None
 
 
