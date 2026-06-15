@@ -27,6 +27,7 @@ import json
 import math
 import os
 import random
+import re
 import socket
 import subprocess
 import sys
@@ -50,6 +51,31 @@ IS_MACOS   = sys.platform == "darwin"
 # ── Chromium sandbox fix for frozen apps (Windows only) ──
 if getattr(sys, 'frozen', False) and IS_WINDOWS:
     os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+
+
+# ── App data locations (baked virtual worlds live here) ──
+def app_data_dir() -> Path:
+    if IS_MACOS:
+        return Path.home() / "Library" / "Application Support" / "RideSim"
+    if IS_WINDOWS:
+        return Path(os.environ.get("APPDATA") or Path.home()) / "RideSim"
+    return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "RideSim"
+
+
+def worlds_dir() -> Path:
+    d = app_data_dir() / "worlds"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def find_bake_tool() -> Optional[Path]:
+    """Locate tools/bake_world.py — bundled alongside (frozen, P6 step 5) or the
+    dev sibling repo ride-sim-world/tools."""
+    for c in (_here / "tools" / "bake_world.py",
+              _here.parent / "ride-sim-world" / "tools" / "bake_world.py"):
+        if c.exists():
+            return c
+    return None
 
 from bleak import BleakClient, BleakScanner
 
@@ -3095,6 +3121,128 @@ class AboutDialog(QtWidgets.QDialog):
         )
 
 
+class BakeWorldDialog(QtWidgets.QDialog):
+    """Bake a route (.gpx/.tcx/.fit) into a Godot virtual world by running
+    tools/bake_world.py as a subprocess, with live progress. On Accept,
+    result_world_dir holds the baked folder and result_tcx the matching ride
+    file (the generated TCX for GPX/FIT, or the route itself for TCX)."""
+
+    def __init__(self, bake_tool: Path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bake virtual world")
+        self.setStyleSheet(DARK_STYLESHEET)
+        self.setMinimumWidth(560)
+        self._bake_tool = bake_tool
+        self._proc: Optional[QtCore.QProcess] = None
+        self._route = ""
+        self._out_dir: Optional[Path] = None
+        self.result_world_dir = ""
+        self.result_tcx = ""
+        self._build()
+
+    def _build(self):
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        rrow = QtWidgets.QHBoxLayout()
+        rlbl = QtWidgets.QLabel("Route file:"); rlbl.setFixedWidth(80)
+        self._route_edit = QtWidgets.QLineEdit(); self._route_edit.setReadOnly(True)
+        self._route_edit.setPlaceholderText("Pick a .gpx / .tcx / .fit route to build a world from")
+        rbtn = QtWidgets.QPushButton("Browse…"); rbtn.setFixedWidth(80)
+        rbtn.clicked.connect(self._pick_route)
+        rrow.addWidget(rlbl); rrow.addWidget(self._route_edit, 1); rrow.addWidget(rbtn)
+        lay.addLayout(rrow)
+
+        orow = QtWidgets.QHBoxLayout()
+        orow.addWidget(QtWidgets.QLabel("Avg speed:"))
+        self._avg = QtWidgets.QSpinBox(); self._avg.setRange(8, 45); self._avg.setValue(22)
+        self._avg.setSuffix(" km/h")
+        orow.addWidget(self._avg)
+        orow.addSpacing(16)
+        self._reverse = QtWidgets.QCheckBox("Reverse route")
+        self._reverse.setToolTip("For a course routed backwards down a one-way street.")
+        orow.addWidget(self._reverse); orow.addStretch()
+        lay.addLayout(orow)
+
+        hint = QtWidgets.QLabel(
+            "One-time: fetches public DEM + OSM for the route (cached after, then "
+            "offline). Typically ~15–60 s. Saved under your app data / worlds.")
+        hint.setStyleSheet("color:#888; font-size:10px;"); hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self._bar = QtWidgets.QProgressBar(); self._bar.setRange(0, 4); self._bar.setValue(0)
+        lay.addWidget(self._bar)
+        self._log = QtWidgets.QPlainTextEdit(); self._log.setReadOnly(True)
+        self._log.setMaximumBlockCount(800); self._log.setMinimumHeight(170)
+        self._log.setStyleSheet(f"font-family:'{MONO_FONT}'; font-size:11px; background:#0a0a0f;")
+        lay.addWidget(self._log, 1)
+
+        brow = QtWidgets.QHBoxLayout(); brow.addStretch()
+        self._close_btn = QtWidgets.QPushButton("Close"); self._close_btn.clicked.connect(self._on_close)
+        self._bake_btn = QtWidgets.QPushButton("Bake"); self._bake_btn.setEnabled(False)
+        self._bake_btn.clicked.connect(self._start)
+        brow.addWidget(self._close_btn); brow.addWidget(self._bake_btn)
+        lay.addLayout(brow)
+
+    def _pick_route(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select route", "", "Routes (*.gpx *.tcx *.fit);;All files (*)")
+        if path:
+            self._route = path
+            self._route_edit.setText(path)
+            self._bake_btn.setEnabled(True)
+
+    def _start(self):
+        if not self._route:
+            return
+        self._out_dir = worlds_dir() / Path(self._route).stem
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        args = [str(self._bake_tool), self._route,
+                "--out-dir", str(self._out_dir), "--avg", str(self._avg.value())]
+        if self._reverse.isChecked():
+            args.append("--reverse")
+        self._bake_btn.setEnabled(False)
+        self._log.clear(); self._bar.setValue(0)
+        self._proc = QtCore.QProcess(self)
+        self._proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        self._proc.readyReadStandardOutput.connect(self._on_output)
+        self._proc.finished.connect(self._on_finished)
+        self._proc.start(sys.executable, args)
+
+    def _on_output(self):
+        data = bytes(self._proc.readAllStandardOutput()).decode(errors="replace")
+        for line in data.splitlines():
+            self._log.appendPlainText(line)
+            m = re.search(r"\[(\d+)/(\d+)\]", line)
+            if m:
+                self._bar.setMaximum(int(m.group(2)))
+                self._bar.setValue(int(m.group(1)))
+
+    def _on_finished(self, code, _status):
+        self._proc = None
+        if code == 0:
+            self._bar.setValue(self._bar.maximum())
+            self.result_world_dir = str(self._out_dir)
+            tcx = self._out_dir / (Path(self._route).stem + ".tcx")
+            if tcx.exists():
+                self.result_tcx = str(tcx)
+            elif self._route.lower().endswith(".tcx"):
+                self.result_tcx = self._route
+            self._log.appendPlainText("\n✓ World baked — click ‘Use this world’.")
+            self._bake_btn.setText("Use this world"); self._bake_btn.setEnabled(True)
+            self._bake_btn.clicked.disconnect()
+            self._bake_btn.clicked.connect(self.accept)
+        else:
+            self._log.appendPlainText(f"\n✗ Bake failed (exit {code}).")
+            self._bake_btn.setText("Bake"); self._bake_btn.setEnabled(True)
+
+    def _on_close(self):
+        if self._proc is not None:
+            self._proc.kill()
+            self._proc = None
+        self.reject()
+
+
 class StartupDialog(QtWidgets.QDialog):
     def __init__(self, last: dict):
         super().__init__()
@@ -3138,11 +3286,23 @@ class StartupDialog(QtWidgets.QDialog):
             "World data:", "", "world_data", directory=True)
         lay.addWidget(self._world_app_row)
         lay.addWidget(self._world_data_row)
+
+        bake_row = QtWidgets.QHBoxLayout()
+        bake_row.addSpacing(90)
+        self._bake_world_btn = QtWidgets.QPushButton("⚙  Bake world from a route…")
+        self._bake_world_btn.setToolTip(
+            "Build a new virtual world from a GPX/TCX/FIT route (one-time DEM+OSM "
+            "fetch), then fill World data + TCX automatically.")
+        self._bake_world_btn.clicked.connect(self._open_bake)
+        bake_row.addWidget(self._bake_world_btn); bake_row.addStretch()
+        self._bake_row_w = QtWidgets.QWidget(); self._bake_row_w.setLayout(bake_row)
+        lay.addWidget(self._bake_row_w)
+
         self._virtual_hint = QtWidgets.QLabel(
             "World app = the RideSimWorld renderer (e.g. build/RideSimWorld.app). "
-            "World data = a baked world folder from tools/bake_world.py (contains "
-            "world.json). Leave blank to launch the world yourself — ride_sim still "
-            "drives it over UDP.")
+            "World data = a baked world folder (contains world.json) — or use "
+            "“Bake world from a route…” to make one. Leave blank to launch the "
+            "world yourself — ride_sim still drives it over UDP.")
         self._virtual_hint.setStyleSheet("color:#555; font-size:10px; margin-left:95px;")
         self._virtual_hint.setWordWrap(True)
         lay.addWidget(self._virtual_hint)
@@ -3208,7 +3368,23 @@ class StartupDialog(QtWidgets.QDialog):
         self._video_row.setVisible(not virtual)
         self._world_app_row.setVisible(virtual)
         self._world_data_row.setVisible(virtual)
+        self._bake_row_w.setVisible(virtual)
         self._virtual_hint.setVisible(virtual)
+
+    def _open_bake(self):
+        tool = find_bake_tool()
+        if tool is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Bake tool not found",
+                "Couldn't find tools/bake_world.py. In dev it should sit at "
+                "../ride-sim-world/tools/bake_world.py next to the ride-sim repo.")
+            return
+        dlg = BakeWorldDialog(tool, self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            if dlg.result_world_dir:
+                self._world_data_edit.setText(dlg.result_world_dir)
+            if dlg.result_tcx:
+                self._tcx_edit.setText(dlg.result_tcx)
 
     def _file_row(self, label, filt, key, directory=False):
         w   = QtWidgets.QWidget()
