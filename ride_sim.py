@@ -88,6 +88,20 @@ def find_world_app() -> Optional[Path]:
     return None
 
 
+def find_latest_world() -> Optional[Path]:
+    """Most recently baked world under worlds_dir() — a subfolder containing
+    world.json. Lets the startup dialog default World data to what you last baked
+    so a returning user doesn't have to re-browse to it."""
+    try:
+        cands = [d for d in worlds_dir().iterdir()
+                 if d.is_dir() and (d / "world.json").exists()]
+    except OSError:
+        return None
+    if not cands:
+        return None
+    return max(cands, key=lambda d: d.stat().st_mtime)
+
+
 def py_tool_cmd(tool_path) -> list:
     """Command prefix to run a bundled .py tool. Frozen, sys.executable is this app
     (not a python), so re-exec it via the --run-pyfile dispatch in main(); in dev
@@ -3313,6 +3327,12 @@ class StartupDialog(QtWidgets.QDialog):
             wa = find_world_app()
             if wa is not None:
                 self._world_app_edit.setText(str(wa))
+        # Default World data to the most recent baked world (unless the saved one
+        # still exists) so a returning user doesn't have to re-browse to it.
+        saved_data = self._world_data_edit.text().strip()
+        if not saved_data or not Path(saved_data).exists():
+            latest = find_latest_world()
+            self._world_data_edit.setText(str(latest) if latest is not None else "")
         lay.addWidget(self._world_app_row)
         lay.addWidget(self._world_data_row)
 
@@ -3399,6 +3419,29 @@ class StartupDialog(QtWidgets.QDialog):
         self._world_data_row.setVisible(virtual)
         self._bake_row_w.setVisible(virtual)
         self._virtual_hint.setVisible(virtual)
+        if virtual:
+            self._refresh_virtual_state()
+
+    def _refresh_virtual_state(self):
+        """First-run nudge: with no baked world yet, steer the user to ‘Bake
+        world from a route…’ and accent the button; otherwise the normal hint."""
+        has_world = bool(self._world_data_edit.text().strip()) or \
+            find_latest_world() is not None
+        if has_world:
+            self._bake_world_btn.setStyleSheet("")
+            self._virtual_hint.setText(
+                "World app = the RideSimWorld renderer (e.g. build/RideSimWorld.app). "
+                "World data = a baked world folder (contains world.json) — or use "
+                "“Bake world from a route…” to make one. Leave blank to launch the "
+                "world yourself — ride_sim still drives it over UDP.")
+        else:
+            self._bake_world_btn.setStyleSheet(
+                "background:#00a0bb; color:white; font-weight:bold; padding:8px 16px;"
+                "border-radius:6px;")
+            self._virtual_hint.setText(
+                "No virtual world yet. Click “Bake world from a route…” to build one "
+                "from a GPX/TCX/FIT file — it fetches public DEM + OSM once (~15–60 s), "
+                "then rides fully offline.")
 
     def _open_bake(self):
         tool = find_bake_tool()
@@ -3414,6 +3457,7 @@ class StartupDialog(QtWidgets.QDialog):
                 self._world_data_edit.setText(dlg.result_world_dir)
             if dlg.result_tcx:
                 self._tcx_edit.setText(dlg.result_tcx)
+            self._refresh_virtual_state()
 
     def _file_row(self, label, filt, key, directory=False):
         w   = QtWidgets.QWidget()
@@ -3463,6 +3507,18 @@ class StartupDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self, "Missing", "World data folder not found — clear it or fix the path.")
             return
+        # Virtual ride with no world data and no bundled fallback → the renderer
+        # would open empty. Confirm rather than silently launch a blank world.
+        if virtual and not world_data:
+            r = QtWidgets.QMessageBox.question(
+                self, "No world selected",
+                "No World data folder is set, so the renderer will open its empty "
+                "default world.\n\nBake a world from a route first for terrain and "
+                "roads. Start anyway?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if r != QtWidgets.QMessageBox.Yes:
+                return
         ghost = self._ghost_tcx_edit.text().strip()
         if ghost and not Path(ghost).exists():
             QtWidgets.QMessageBox.warning(
@@ -3528,7 +3584,51 @@ def _resolve_app_binary(path: Path) -> Optional[Path]:
     return None
 
 
-def launch_world_renderer(world_app: str, world_data: str):
+def pick_ride_screens(app):
+    """Choose (cockpit_screen, world_screen) for a virtual ride.
+
+    world  → the LARGEST display (the immersive Godot world belongs on the big
+             external monitor); cockpit → the smallest (the laptop dashboard).
+    Keyed on size, NOT the OS "primary" flag, so it survives an external set as
+    the main display (the common desk setup). One display → both are it (the
+    single-window overlay mode is the answer there; see ROADMAP 5d)."""
+    screens = app.screens()
+    if not screens:
+        return None, None
+    if len(screens) == 1:
+        return screens[0], screens[0]
+    def area(s):
+        g = s.geometry()
+        return g.width() * g.height()
+    world = max(screens, key=area)
+    cockpit = min(screens, key=area)
+    if cockpit is world:  # equal-size displays → keep them distinct
+        others = [s for s in screens if s is not world]
+        cockpit = others[0] if others else world
+    return cockpit, world
+
+
+def place_main_window(win, screen):
+    """Put the ride_sim dashboard on its screen and bring it to the front. With
+    the world on a different monitor this removes the startup overlap (HUD pills
+    flashing over Godot) and the manual dock-click + drag to the laptop screen."""
+    if screen is None:
+        win.resize(1440, 900)
+        win.show()
+        return
+    geo = screen.availableGeometry()
+    w = min(1440, geo.width() - 80)
+    h = min(900, geo.height() - 80)
+    win.resize(max(800, w), max(600, h))
+    # Center within the chosen screen before showing so it never lands elsewhere.
+    win.move(geo.center().x() - win.width() // 2,
+             geo.center().y() - win.height() // 2)
+    win.show()
+    win.raise_()
+    win.activateWindow()
+
+
+def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None):
     """
     Launch the exported RideSimWorld renderer for a virtual ride and point it at
     the baked world via the RIDESIM_WORLD_DIR env var (the renderer reads its data
@@ -3549,6 +3649,11 @@ def launch_world_renderer(world_app: str, world_data: str):
     env = dict(os.environ)
     if world_data:
         env["RIDESIM_WORLD_DIR"] = str(Path(world_data).resolve())
+    # Hint which monitor to fullscreen on: a global (x,y) point inside the target
+    # screen. The renderer picks the screen containing it (Main.gd), so this is
+    # robust to Qt/Godot screen-index ordering differing.
+    if world_screen_pos is not None:
+        env["RIDESIM_WORLD_SCREEN_POS"] = f"{world_screen_pos.x()},{world_screen_pos.y()}"
     try:
         proc = subprocess.Popen([str(binp)], env=env)
         print(f"Launched world renderer: {binp}  RIDESIM_WORLD_DIR={env.get('RIDESIM_WORLD_DIR','(bundled)')}")
@@ -3619,9 +3724,16 @@ def main():
     # Virtual-world ride: the Godot world is the view. Force map-drive (no video
     # controller to hunt) and launch Godot if the user configured its paths.
     godot_proc = None
+    cockpit_screen = world_screen = None
     if cfg.get("virtual"):
         state.video_lock = True
-        godot_proc = launch_world_renderer(cfg.get("world_app", ""), cfg.get("world_data", ""))
+        cockpit_screen, world_screen = pick_ride_screens(app)
+        world_pos = (world_screen.geometry().center()
+                     if world_screen is not None and world_screen is not cockpit_screen
+                     else None)
+        godot_proc = launch_world_renderer(
+            cfg.get("world_app", ""), cfg.get("world_data", ""),
+            world_screen_pos=world_pos)
     # Stash route geometry for the curved-centerline tangent renderer. NaN-fill
     # missing lat/lon entries so downstream code can use np.isfinite() masks.
     _lat_arr = _np.asarray([(v if v is not None else math.nan) for v in lat], dtype=float)
@@ -3662,8 +3774,13 @@ def main():
     start_worker_thread(state, signals, time_s, dist_m, elev_m, cfg["sim_mode"])
     win = MainWindow(state, signals, lat, lon, cfg["sim_mode"], cfg["video"],
                      total_dist_m=dist_m[-1])
-    win.resize(1440, 900)
-    win.show()
+    if cfg.get("virtual"):
+        # Dashboard on the cockpit screen, raised above Godot (which is on the
+        # world screen). Removes the dock-click + drag-to-laptop dance.
+        place_main_window(win, cockpit_screen)
+    else:
+        win.resize(1440, 900)
+        win.show()
     app.exec()
 
     # Close the Godot world we launched (if any) when the ride window exits.
