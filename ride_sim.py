@@ -3194,14 +3194,41 @@ class BakeWorldDialog(QtWidgets.QDialog):
         orow.addSpacing(16)
         self._reverse = QtWidgets.QCheckBox("Reverse route")
         self._reverse.setToolTip("For a course routed backwards down a one-way street.")
-        orow.addWidget(self._reverse); orow.addStretch()
+        orow.addWidget(self._reverse)
+        orow.addSpacing(16)
+        orow.addWidget(QtWidgets.QLabel("Detail:"))
+        self._detail = QtWidgets.QComboBox()
+        self._detail.addItems(["Standard", "High", "Ultra"])
+        self._detail.setToolTip(
+            "Terrain resolution. Higher = sharper hills and tighter road cuts, but a "
+            "larger world file and more GPU. 'Ultra' also fetches finer DEM tiles "
+            "(longer one-time download).")
+        self._detail.currentIndexChanged.connect(self._update_detail_hint)
+        orow.addWidget(self._detail)
+        orow.addStretch()
         lay.addLayout(orow)
+
+        # (grid, zoom) per detail level. grid = heightfield resolution (world-file
+        # size + GPU); zoom = DEM tile zoom (download). Only Ultra bumps zoom.
+        self._DETAIL = [
+            (1024, 14, "Standard — fast, smallest world file, lowest GPU."),
+            (2048, 14, "High — sharper terrain & tighter road cuts from the same DEM "
+                       "(no extra download); larger world file + more GPU."),
+            (3072, 15, "Ultra — finest detail; fetches finer DEM tiles (~4× longer "
+                       "one-time download) and a much larger file + GPU load."),
+        ]
 
         hint = QtWidgets.QLabel(
             "One-time: fetches public DEM + OSM for the route (cached after, then "
             "offline). Typically ~15–60 s. Saved under your app data / worlds.")
         hint.setStyleSheet("color:#888; font-size:10px;"); hint.setWordWrap(True)
         lay.addWidget(hint)
+
+        self._detail_hint = QtWidgets.QLabel()
+        self._detail_hint.setStyleSheet("color:#888; font-size:10px;")
+        self._detail_hint.setWordWrap(True)
+        lay.addWidget(self._detail_hint)
+        self._update_detail_hint()
 
         self._bar = QtWidgets.QProgressBar(); self._bar.setRange(0, 4); self._bar.setValue(0)
         lay.addWidget(self._bar)
@@ -3217,6 +3244,10 @@ class BakeWorldDialog(QtWidgets.QDialog):
         brow.addWidget(self._close_btn); brow.addWidget(self._bake_btn)
         lay.addLayout(brow)
 
+    def _update_detail_hint(self):
+        self._detail_hint.setText(
+            "Terrain detail: " + self._DETAIL[self._detail.currentIndex()][2])
+
     def _pick_route(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select route", "", "Routes (*.gpx *.tcx *.fit);;All files (*)")
@@ -3230,8 +3261,10 @@ class BakeWorldDialog(QtWidgets.QDialog):
             return
         self._out_dir = worlds_dir() / Path(self._route).stem
         self._out_dir.mkdir(parents=True, exist_ok=True)
+        grid, zoom, _ = self._DETAIL[self._detail.currentIndex()]
         cmd = py_tool_cmd(self._bake_tool) + [
-            self._route, "--out-dir", str(self._out_dir), "--avg", str(self._avg.value())]
+            self._route, "--out-dir", str(self._out_dir), "--avg", str(self._avg.value()),
+            "--grid", str(grid), "--zoom", str(zoom)]
         if self._reverse.isChecked():
             cmd.append("--reverse")
         self._bake_btn.setEnabled(False)
