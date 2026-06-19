@@ -55,7 +55,7 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, [],
     exclude_binaries=True,
-    name="RideSim",
+    name="Ride Sim",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -67,5 +67,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, upx_exclude=[], name="RideSim")
-app = BUNDLE(coll, name="RideSim.app", icon=None, bundle_identifier="com.ridesim.app")
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, upx_exclude=[], name="Ride Sim")
+app = BUNDLE(coll, name="Ride Sim.app", icon=None, bundle_identifier="com.ridesim.app")
