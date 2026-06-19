@@ -3709,6 +3709,15 @@ def main():
     # via runpy and exit, so the same app doubles as the python for the tools.
     if getattr(sys, "frozen", False) and len(sys.argv) >= 3 and sys.argv[1] == "--run-pyfile":
         import runpy
+        # The bake tools print Unicode (e.g. "→", "✓"). When re-exec'd, the child's
+        # piped stdout/stderr default to the legacy Windows codepage (cp1252), which
+        # raises UnicodeEncodeError. Force UTF-8 — the parent QProcess reader decodes
+        # UTF-8 — so all tools (and bake_world's own sub-tool calls) emit safely.
+        for _stream in (sys.stdout, sys.stderr):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
         script = sys.argv[2]
         sys.argv = [script] + sys.argv[3:]
         runpy.run_path(script, run_name="__main__")
