@@ -80,9 +80,15 @@ def find_bake_tool() -> Optional[Path]:
 
 def find_world_app() -> Optional[Path]:
     """Locate the Godot world renderer — bundled inside the app (frozen) or the
-    dev sibling export at ride-sim-world/build."""
-    for c in (_here / "world" / "RideSimWorld.app",
-              _here.parent / "ride-sim-world" / "build" / "RideSimWorld.app"):
+    dev sibling export at ride-sim-world/build. macOS ships a .app bundle;
+    Windows ships RideSimWorld.exe (+ .pck) in a folder."""
+    if sys.platform.startswith("win"):
+        cands = (_here / "world" / "RideSimWorld.exe",
+                 _here.parent / "ride-sim-world" / "build" / "win" / "RideSimWorld.exe")
+    else:
+        cands = (_here / "world" / "RideSimWorld.app",
+                 _here.parent / "ride-sim-world" / "build" / "RideSimWorld.app")
+    for c in cands:
         if c.exists():
             return c
     return None

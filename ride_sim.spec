@@ -5,15 +5,25 @@
 # --run-pyfile re-exec shim), and the exported Godot renderer (world/).
 #
 # Build:  pyinstaller --noconfirm RideSim.spec
-# The renderer must be exported first:
-#   (in ride-sim-world/godot) Godot --headless --export-release "macOS" ../build/RideSimWorld.app
+# The renderer must be exported first (in ride-sim-world/godot):
+#   macOS:    Godot --headless --export-release "macOS" ../build/RideSimWorld.app
+#   Windows:  Godot --headless --export-release "Windows Desktop" ../build/win/RideSimWorld.exe
 #
 import os
+import sys
 
 HERE     = SPECPATH
 WORLD    = os.path.abspath(os.path.join(HERE, "..", "ride-sim-world"))
 TOOLS    = os.path.join(WORLD, "tools")
-RENDERER = os.path.join(WORLD, "build", "RideSimWorld.app")
+# The renderer is platform-specific: macOS ships the .app bundle, Windows ships
+# the Godot export folder (RideSimWorld.exe + .pck). Each is bundled under
+# world/ so find_world_app() in ride_sim.py resolves it the same way frozen.
+if sys.platform == "darwin":
+    RENDERER, RENDERER_DEST = os.path.join(WORLD, "build", "RideSimWorld.app"), "world/RideSimWorld.app"
+elif sys.platform.startswith("win"):
+    RENDERER, RENDERER_DEST = os.path.join(WORLD, "build", "win"), "world"
+else:
+    RENDERER, RENDERER_DEST = None, None
 
 datas = [
     (os.path.join(HERE, "THIRD_PARTY_LICENSES.txt"), "."),
@@ -25,8 +35,8 @@ datas = [
 ]
 # Bundle the renderer if it's been exported; otherwise the app falls back to the
 # dev export / a user-picked World app.
-if os.path.isdir(RENDERER):
-    datas.append((RENDERER, "world/RideSimWorld.app"))
+if RENDERER and os.path.isdir(RENDERER):
+    datas.append((RENDERER, RENDERER_DEST))
 
 a = Analysis(
     [os.path.join(HERE, "ride_sim.py")],
