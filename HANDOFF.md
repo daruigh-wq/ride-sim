@@ -14,14 +14,19 @@ here.
 - **macOS**: `.dmg` built, ad-hoc signed, and install-tested on Apple Silicon.
   Bundles the Godot renderer. **Apple-Silicon-only** (`target_arch=None` in the
   spec → host-arch build).
-- **GitHub Release**: `v0.1.0-beta` exists as a **DRAFT** (prerelease, target
-  `main`) carrying only the mac dmg. Waiting on the Windows asset to publish.
-- **Windows**: fully scripted, **not yet built** — that's the remaining work,
-  done on the PC.
+- **GitHub Release**: `v0.1.0-beta` is **PUBLISHED** (prerelease, tag on `main`)
+  carrying both the mac dmg and the Windows installer:
+  https://github.com/daruigh-wq/ride-sim/releases/tag/v0.1.0-beta
+- **Windows**: **built and shipped** — `Ride Sim-0.1.0-beta-windows-setup.exe`
+  (PyInstaller + Inno Setup), install-tested on Windows 11 x64. Bundles the
+  Godot Windows renderer and the bake pipeline.
 
 ## Prerequisites
 
 - Python 3.10+ with `PySide6`, `PySide6-Addons`, `bleak`, plus `pyinstaller`.
+  The bake pipeline also needs `Pillow`, `fitparse`, and `numpy` — the spec's
+  `PIL.Image`/`fitparse` hidden imports are silently dropped (and baking fails
+  in the frozen app) if they aren't installed.
 - **Godot 4.6** with the matching **export templates** installed (macOS templates
   on the Mac; **Windows Desktop** templates on the PC).
 - macOS only: `brew install create-dmg`.
@@ -76,3 +81,7 @@ Publishing creates the `v0.1.0-beta` tag at `main`. Release notes live in
   the Mac), but the PyInstaller wrap can't.
 - `dist/` and `build/` are gitignored — installers are local artifacts, attached
   to the Release, never committed.
+- **Frozen bake tools must emit UTF-8.** The `--run-pyfile` shim re-execs the
+  tools with piped stdout/stderr, which on Windows default to cp1252 and raise
+  `UnicodeEncodeError` on any non-ASCII output (e.g. the `→`/`✓` progress lines).
+  `main()` forces UTF-8 on those streams; don't remove that.
