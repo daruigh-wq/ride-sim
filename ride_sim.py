@@ -939,13 +939,17 @@ async def run_ride_loop(
         except OSError:
             world_recv = None
 
-    def _emit_world(dist_val, speed_val):
+    def _emit_world(dist_val, speed_val, paused=False):
         if world_sock is None:
             return
-        msg = {"distance_m": round(dist_val, 2), "speed_mps": round(speed_val, 3)}
+        msg = {"distance_m": round(dist_val, 2), "speed_mps": round(speed_val, 3),
+               "paused": bool(paused)}   # world holds the AI pack while the ride is paused
         with state.lock:
+            msg["cadence_rpm"] = round(state.cadence_rpm, 1)   # drives crank+cassette; 0 = coast
+            msg["power_w"]    = round(state.power_w, 1)        # live/sim watts (world HUD, pacing)
             if state.ghost_active and state.ghost_dist_m is not None:
                 msg["ghost_distance_m"] = round(state.ghost_dist_m, 2)
+                msg["ghost_speed_mps"] = round(state.ghost_speed_mps, 3)
         try:
             world_sock.sendto(json.dumps(msg).encode(), WORLD_UDP_ADDR)
         except OSError:
@@ -1007,6 +1011,13 @@ async def run_ride_loop(
                         state.started = True
                         state.status  = "Running"
                         state.ride_start_time = time.time()
+                        # Anchor the ghost clock to the start line. Its position is
+                        # interp(t_sim - ghost_t_offset_s), and t_sim has been ticking
+                        # since worker start (BLE connect). Without this, the whole
+                        # pre-start idle (waiting at the line) counts as ghost ride
+                        # time, so the ghost snaps ~hundreds of m ahead the instant we
+                        # start. Discard that idle so the ghost leaves d=0 with us.
+                        state.ghost_t_offset_s = t_sim
                     signals.request_play.emit()
                     started = True
             else:
@@ -1105,7 +1116,7 @@ async def run_ride_loop(
                 # end value while auto-paused — the seek block returns early,
                 # before the normal state update at the bottom of the loop.
                 state.virtual_dist_m = virtual_dist
-            _emit_world(virtual_dist, 0.0)
+            _emit_world(virtual_dist, 0.0, paused=is_paused)
             signals.request_video_seek.emit(offset + target_route_t)
             with state.lock:
                 state.seek_to_dist_m = -1.0
@@ -1131,7 +1142,7 @@ async def run_ride_loop(
                 state.speed_mps_smoothed = 0.0
                 state.cadence_rpm        = 0.0
                 state.power_w            = 0.0
-            _emit_world(virtual_dist, 0.0)
+            _emit_world(virtual_dist, 0.0, paused=True)
             continue
 
         with state.lock:
@@ -1307,7 +1318,11 @@ async def worker_sim(state, signals, time_s, dist_m, elev_m):
     with state.lock:
         state.ble_status = "SIM MODE"
         state.hr_status  = "SIM HR"
-        state.status     = "SIM MODE — waiting for speed gate…"
+        # Start PAUSED: the simulated rider takes off instantly (no trainer to wait
+        # for), which used to mean the ride — and a race-mode AI pack — was long gone
+        # by the time the 3D world finished loading. Space (either window) starts it.
+        state.user_paused = True
+        state.status     = "SIM MODE — paused at the line; press Space to roll out"
 
     await run_ride_loop(state, signals, time_s, dist_m, elev_m, get_telemetry)
 
@@ -3402,6 +3417,72 @@ class StartupDialog(QtWidgets.QDialog):
         lay.addWidget(ghost_row)
         lay.addWidget(ghost_hint)
 
+        # Virtual peloton (Godot world only): N AI riders fanned around the player.
+        # Off = a solo ride. Combine freely with the ghost above.
+        pel_w = QtWidgets.QWidget()
+        pel_v = QtWidgets.QVBoxLayout(pel_w)
+        pel_v.setContentsMargins(0, 0, 0, 0)
+        pel_v.setSpacing(4)
+        pel_row = QtWidgets.QHBoxLayout()
+        pel_row.setContentsMargins(0, 0, 0, 0)
+        pel_lbl = QtWidgets.QLabel("Peloton:")
+        pel_lbl.setFixedWidth(90)
+        self.peloton_cb = QtWidgets.QCheckBox("Ride with a virtual peloton")
+        self.peloton_spin = QtWidgets.QSpinBox()
+        self.peloton_spin.setRange(1, 300)
+        self.peloton_spin.setValue(int(self._last.get("peloton_n", 0) or 12))
+        self.peloton_spin.setSuffix(" riders")
+        self.peloton_spin.setFixedWidth(110)
+        _pel_on = int(self._last.get("peloton_n", 0) or 0) > 0
+        self.peloton_cb.setChecked(_pel_on)
+        self.peloton_spin.setEnabled(_pel_on)
+        self.peloton_cb.toggled.connect(self.peloton_spin.setEnabled)
+        self.peloton_cb.setToolTip(
+            "Adds AI riders that lean through corners, take a racing line, weave, and "
+            "trade places with you. Godot world rides only.")
+        # Field level → how wide the riders' fitness spread is (and how the pack rides).
+        # Recreational = mixed abilities, big speed swings, strung out. Pro = even & fast,
+        # tight pack, sharp apexes. Maps to RIDESIM_PELOTON_LEVEL in the world.
+        self.peloton_level = QtWidgets.QComboBox()
+        self._peloton_levels = [
+            ("Recreational", "recreational"), ("Cat 3", "cat3"), ("Cat 2", "cat2"),
+            ("Cat 1 / elite", "cat1"), ("Pro tour", "pro")]
+        for label, _key in self._peloton_levels:
+            self.peloton_level.addItem(label)
+        _saved_lvl = str(self._last.get("peloton_level", "cat3"))
+        _lvl_idx = next((i for i, (_l, k) in enumerate(self._peloton_levels)
+                         if k == _saved_lvl), 1)
+        self.peloton_level.setCurrentIndex(_lvl_idx)
+        self.peloton_level.setEnabled(_pel_on)
+        self.peloton_level.setToolTip(
+            "Field level sets the riders' fitness spread and pack behavior — not a pace "
+            "you must match (the pack rides around your speed).")
+        self.peloton_cb.toggled.connect(self.peloton_level.setEnabled)
+        pel_row.addWidget(pel_lbl)
+        pel_row.addWidget(self.peloton_cb)
+        pel_row.addWidget(self.peloton_spin)
+        pel_row.addWidget(self.peloton_level)
+        pel_row.addStretch()
+        pel_v.addLayout(pel_row)
+        # Free-pace sub-row: the pack rides its own pace and drops you if you can't hold.
+        fp_row = QtWidgets.QHBoxLayout()
+        fp_row.setContentsMargins(0, 0, 0, 0)
+        fp_row.addSpacing(90)
+        self.peloton_free_cb = QtWidgets.QCheckBox(
+            "Race pace — don't wait for me (the pack rides away if I can't hold on)")
+        self.peloton_free_cb.setChecked(bool(self._last.get("peloton_free", False)))
+        self.peloton_free_cb.setEnabled(_pel_on)
+        self.peloton_free_cb.setToolTip(
+            "Off: the pack rides around your speed so you stay in the bunch.\n"
+            "On: the pack holds its own pace and you get dropped if you fade — "
+            "‘try to stay with Tadej’. Combines with a ghost.")
+        self.peloton_cb.toggled.connect(self.peloton_free_cb.setEnabled)
+        fp_row.addWidget(self.peloton_free_cb)
+        fp_row.addStretch()
+        pel_v.addLayout(fp_row)
+        self._peloton_row = pel_w
+        lay.addWidget(pel_w)
+
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Video offset (s):"))
         self.offset_spin = QtWidgets.QDoubleSpinBox()
@@ -3458,6 +3539,7 @@ class StartupDialog(QtWidgets.QDialog):
         self._world_data_row.setVisible(virtual)
         self._bake_row_w.setVisible(virtual)
         self._virtual_hint.setVisible(virtual)
+        self._peloton_row.setVisible(virtual)   # peloton exists only in the Godot world
         if virtual:
             self._refresh_virtual_state()
 
@@ -3574,6 +3656,10 @@ class StartupDialog(QtWidgets.QDialog):
             "mode_idx":   self.mode_combo.currentIndex(),
             "ghost_tcx":  ghost,
             "record":     self.record_cb.isChecked(),
+            "peloton_n":  (self.peloton_spin.value()
+                           if (virtual and self.peloton_cb.isChecked()) else 0),
+            "peloton_level": self._peloton_levels[self.peloton_level.currentIndex()][1],
+            "peloton_free": self.peloton_free_cb.isChecked(),
         }
         self.accept()
 
@@ -3667,7 +3753,9 @@ def place_main_window(win, screen):
     win.activateWindow()
 
 
-def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None):
+def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None,
+                          peloton_n: int = 0, peloton_level: str = "",
+                          peloton_free: bool = False):
     """
     Launch the exported RideSimWorld renderer for a virtual ride and point it at
     the baked world via the RIDESIM_WORLD_DIR env var (the renderer reads its data
@@ -3693,9 +3781,26 @@ def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None
     # robust to Qt/Godot screen-index ordering differing.
     if world_screen_pos is not None:
         env["RIDESIM_WORLD_SCREEN_POS"] = f"{world_screen_pos.x()},{world_screen_pos.y()}"
+    # Peloton size → RIDESIM_PELOTON_N, which the world reads to spawn N AI riders
+    # (0/unset = a solo ride, no cost). A terminal-set env var wins (dev/benchmark
+    # override); otherwise the startup dialog's peloton count is used. See
+    # ride-sim-world _build_peloton().
+    pelo = os.environ.get("RIDESIM_PELOTON_N", "").strip()
+    if not pelo and peloton_n and int(peloton_n) > 0:
+        pelo = str(int(peloton_n))
+    if pelo:
+        env["RIDESIM_PELOTON_N"] = pelo
+        # Field level (FTP/category) → ability spread + pack behavior. Env wins (dev).
+        lvl = os.environ.get("RIDESIM_PELOTON_LEVEL", "").strip() or (peloton_level or "")
+        if lvl:
+            env["RIDESIM_PELOTON_LEVEL"] = lvl
+        # Free pace: pack rides its own pace and drops you (env wins for dev).
+        free_env = os.environ.get("RIDESIM_PELOTON_FREE", "").strip()
+        env["RIDESIM_PELOTON_FREE"] = free_env if free_env else ("1" if peloton_free else "0")
     try:
         proc = subprocess.Popen([str(binp)], env=env)
-        print(f"Launched world renderer: {binp}  RIDESIM_WORLD_DIR={env.get('RIDESIM_WORLD_DIR','(bundled)')}")
+        extra = f"  RIDESIM_PELOTON_N={pelo}" if pelo else ""
+        print(f"Launched world renderer: {binp}  RIDESIM_WORLD_DIR={env.get('RIDESIM_WORLD_DIR','(bundled)')}{extra}")
         return proc
     except Exception as e:
         print(f"Could not launch world renderer ({e}); start it yourself — UDP still drives it.")
@@ -3755,6 +3860,9 @@ def main():
         "world_type": 1 if cfg.get("virtual") else 0,
         "world_app":  cfg.get("world_app", ""),
         "world_data": cfg.get("world_data", ""),
+        "peloton_n":  cfg.get("peloton_n", 0),
+        "peloton_level": cfg.get("peloton_level", "cat3"),
+        "peloton_free": cfg.get("peloton_free", False),
     })
 
     try:
@@ -3781,7 +3889,9 @@ def main():
                      else None)
         godot_proc = launch_world_renderer(
             cfg.get("world_app", ""), cfg.get("world_data", ""),
-            world_screen_pos=world_pos)
+            world_screen_pos=world_pos, peloton_n=cfg.get("peloton_n", 0),
+            peloton_level=cfg.get("peloton_level", ""),
+            peloton_free=cfg.get("peloton_free", False))
     # Stash route geometry for the curved-centerline tangent renderer. NaN-fill
     # missing lat/lon entries so downstream code can use np.isfinite() masks.
     _lat_arr = _np.asarray([(v if v is not None else math.nan) for v in lat], dtype=float)

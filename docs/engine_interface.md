@@ -13,9 +13,16 @@ concrete subset of this contract over UDP JSON-lines on `localhost`:
 
 - **Forward `ride_sim → world` (port 5005):** one JSON object per packet at the
   ~4 Hz loop tick:
-  `{"distance_m": <m>, "speed_mps": <m/s>[, "ghost_distance_m": <m>]}`.
+  `{"distance_m": <m>, "speed_mps": <m/s>, "paused": <bool>, "cadence_rpm": <rpm>, "power_w": <W>[, "ghost_distance_m": <m>, "ghost_speed_mps": <m/s>]}`.
   The world snaps to `distance_m` and dead-reckons with `speed_mps` between
-  packets. `ghost_distance_m` is sent only when a ghost is active; the world
+  packets. `paused` is true while the ride is paused (Space, or the low-speed
+  auto-pause) — the world holds the AI peloton on it, so the bunch doesn't ride
+  away during a pause; the world also holds the pack until the FIRST packet
+  arrives (startup, while the ride hasn't passed the speed gate). `cadence_rpm`
+  drives the avatar's crank (0 = coast); `power_w` is the
+  live/sim rider watts (world HUD + future pacing use — the peloton's companion
+  mode currently infers effort from speed+grade instead, so it works even without
+  this field). `ghost_distance_m` is sent only when a ghost is active; the world
   places the ghost avatar there (else a fixed demo gap). At the finish ride_sim
   emits `speed_mps = 0` so the world holds still; when paused it emits the frozen
   distance + 0.

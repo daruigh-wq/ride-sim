@@ -68,4 +68,16 @@ exe = EXE(
     entitlements_file=None,
 )
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, upx_exclude=[], name="Ride Sim")
-app = BUNDLE(coll, name="Ride Sim.app", icon=None, bundle_identifier="com.ridesim.app")
+app = BUNDLE(
+    coll,
+    name="Ride Sim.app",
+    icon=None,
+    bundle_identifier="com.ridesim.app",
+    info_plist={
+        # macOS kills the app under TCC if it touches Bluetooth without these.
+        "NSBluetoothAlwaysUsageDescription":
+            "Ride Sim connects to your BLE smart trainer and heart-rate monitor.",
+        "NSBluetoothPeripheralUsageDescription":
+            "Ride Sim connects to your BLE smart trainer and heart-rate monitor.",
+    },
+)
