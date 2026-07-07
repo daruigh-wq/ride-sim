@@ -2093,6 +2093,11 @@ class VideoPanel(QtWidgets.QWidget):
         self.overlay.setAttribute(Qt.WA_TranslucentBackground)
         self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.overlay.setAttribute(Qt.WA_ShowWithoutActivating)
+        # On macOS a Qt.Tool window is an NSPanel, which auto-hides whenever the
+        # app is deactivated. That makes the HUD vanish from screen recordings
+        # (OBS, screencapture, etc.) the moment focus leaves ride_sim. Keep it
+        # shown when inactive so it's always captured. (No-op off macOS.)
+        self.overlay.setAttribute(Qt.WA_MacAlwaysShowToolWindow)
 
         # Connect worker signals
         signals.request_play.connect(self._play)
@@ -3335,6 +3340,152 @@ class BakeWorldDialog(QtWidgets.QDialog):
         self.reject()
 
 
+#  Route previews & world↔route matching (startup dialog)
+#  ─────────────────────────────────────────────────────────────
+#  A baked world and its ride TCX both carry a lat/lon footprint (the TCX in its
+#  trackpoints, the world in route.json's bbox), so we can draw a thumbnail of the
+#  route and cross-check that a chosen world actually covers it before launching.
+
+def _bbox_of(latlon) -> Optional[dict]:
+    if not latlon:
+        return None
+    lats = [p[0] for p in latlon]
+    lons = [p[1] for p in latlon]
+    return {"lat_min": min(lats), "lat_max": max(lats),
+            "lon_min": min(lons), "lon_max": max(lons)}
+
+
+def load_tcx_preview(tcx_path: str):
+    """(latlon_points, length_km) for a TCX, or ([], 0.0) if it can't be read /
+    has no GPS. latlon_points is a list of (lat, lon) with position data."""
+    try:
+        _, dist_m, _, lat, lon = load_tcx_route(tcx_path)
+    except Exception:
+        return [], 0.0
+    pts = [(a, o) for a, o in zip(lat, lon) if a is not None and o is not None]
+    km = (dist_m[-1] / 1000.0) if dist_m else 0.0
+    return pts, km
+
+
+def world_route_bbox(world_dir) -> Optional[dict]:
+    """The lat/lon bbox a baked world covers — from route.json (exact) or the
+    .bake_osm_route.json signature (fallback)."""
+    d = Path(world_dir)
+    # world.json carries a stamped route_bbox on newly baked worlds; route.json's
+    # bbox and the .bake_osm_route.json signature cover older ones.
+    for name, key in (("world.json", "route_bbox"),
+                      ("route.json", "bbox"),
+                      (".bake_osm_route.json", None)):
+        f = d / name
+        if not f.exists():
+            continue
+        try:
+            j = json.loads(f.read_text())
+        except Exception:
+            continue
+        bb = j.get(key, {}) if key else j
+        if all(k in bb for k in ("lat_min", "lat_max", "lon_min", "lon_max")):
+            return {k: float(bb[k]) for k in
+                    ("lat_min", "lat_max", "lon_min", "lon_max")}
+    return None
+
+
+def bbox_match(a: Optional[dict], b: Optional[dict]) -> float:
+    """0..1 how well two lat/lon bboxes coincide (intersection-over-union).
+    ≳0.3 means the same route; ~0 means a different place entirely."""
+    if not a or not b:
+        return 0.0
+    lat_lo = max(a["lat_min"], b["lat_min"]); lat_hi = min(a["lat_max"], b["lat_max"])
+    lon_lo = max(a["lon_min"], b["lon_min"]); lon_hi = min(a["lon_max"], b["lon_max"])
+    inter = max(0.0, lat_hi - lat_lo) * max(0.0, lon_hi - lon_lo)
+    if inter <= 0:
+        return 0.0
+    area_a = (a["lat_max"] - a["lat_min"]) * (a["lon_max"] - a["lon_min"])
+    area_b = (b["lat_max"] - b["lat_min"]) * (b["lon_max"] - b["lon_min"])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+# Below this IoU we treat a world as not matching the ride's route.
+WORLD_MATCH_MIN = 0.30
+
+
+def find_world_for_route(tcx_path: str) -> Optional[Path]:
+    """Best-matching baked world for a TCX (by bbox overlap), or None."""
+    bb = _bbox_of(load_tcx_preview(tcx_path)[0])
+    if not bb:
+        return None
+    best, best_s = None, WORLD_MATCH_MIN
+    try:
+        worlds = [d for d in worlds_dir().iterdir()
+                  if d.is_dir() and (d / "world.json").exists()]
+    except OSError:
+        return None
+    for w in worlds:
+        s = bbox_match(bb, world_route_bbox(w))
+        if s > best_s:
+            best, best_s = w, s
+    return best
+
+
+def render_route_pixmap(latlon, size=(260, 168), world_bbox=None, match=True):
+    """Dark thumbnail with the route polyline (green start dot → red end dot),
+    optionally overlaying a world's coverage box: green if it matches the route,
+    red-dashed if not. Caller handles the empty / no-GPS case."""
+    W, H = size
+    pm = QtGui.QPixmap(W, H)
+    pm.fill(QtGui.QColor(20, 24, 28))
+    if len(latlon) < 2:
+        return pm
+    lat0 = sum(p[0] for p in latlon) / len(latlon)
+    cosl = math.cos(math.radians(lat0)) or 1e-6
+
+    def proj(lat, lon):
+        return (lon * cosl, lat)   # equirectangular, north-up
+
+    projected = [proj(a, o) for a, o in latlon]
+    box_corners = []
+    if world_bbox:
+        for la in (world_bbox["lat_min"], world_bbox["lat_max"]):
+            for lo in (world_bbox["lon_min"], world_bbox["lon_max"]):
+                box_corners.append(proj(la, lo))
+    allp = projected + box_corners
+    xmin = min(p[0] for p in allp); xmax = max(p[0] for p in allp)
+    ymin = min(p[1] for p in allp); ymax = max(p[1] for p in allp)
+    span_x = max(xmax - xmin, 1e-9); span_y = max(ymax - ymin, 1e-9)
+    m = 12
+    sc = min((W - 2 * m) / span_x, (H - 2 * m) / span_y)
+    ox = (W - span_x * sc) / 2.0
+    oy = (H - span_y * sc) / 2.0
+
+    def to_px(pt):
+        x = ox + (pt[0] - xmin) * sc
+        y = H - (oy + (pt[1] - ymin) * sc)   # flip so north is up
+        return QtCore.QPointF(x, y)
+
+    p = QtGui.QPainter(pm)
+    p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+    if world_bbox:
+        col = QtGui.QColor(70, 200, 120) if match else QtGui.QColor(220, 80, 80)
+        pen = QtGui.QPen(col, 1.2)
+        if not match:
+            pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        c0 = to_px(proj(world_bbox["lat_min"], world_bbox["lon_min"]))
+        c1 = to_px(proj(world_bbox["lat_max"], world_bbox["lon_max"]))
+        p.drawRect(QtCore.QRectF(c0, c1))
+    path = QtGui.QPainterPath(to_px(projected[0]))
+    for pt in projected[1:]:
+        path.lineTo(to_px(pt))
+    p.setPen(QtGui.QPen(QtGui.QColor(0, 229, 255), 2.0))
+    p.drawPath(path)
+    p.setPen(QtCore.Qt.PenStyle.NoPen)
+    p.setBrush(QtGui.QColor(60, 220, 90)); p.drawEllipse(to_px(projected[0]), 3.5, 3.5)
+    p.setBrush(QtGui.QColor(240, 70, 70)); p.drawEllipse(to_px(projected[-1]), 3.5, 3.5)
+    p.end()
+    return pm
+
+
 class StartupDialog(QtWidgets.QDialog):
     def __init__(self, last: dict):
         super().__init__()
@@ -3367,6 +3518,35 @@ class StartupDialog(QtWidgets.QDialog):
         lay.addLayout(wt_row)
 
         lay.addWidget(self._file_row("TCX file:", "*.tcx", "tcx"))
+
+        # Route preview thumbnail + world-match strip (see render_route_pixmap).
+        prev_row = QtWidgets.QHBoxLayout()
+        prev_row.addSpacing(90)
+        self._preview_lbl = QtWidgets.QLabel("route preview")
+        self._preview_lbl.setFixedSize(260, 168)
+        self._preview_lbl.setAlignment(Qt.AlignCenter)
+        self._preview_lbl.setStyleSheet(
+            "border:1px solid #333; border-radius:4px; background:#14181c; color:#555;")
+        pv = QtWidgets.QVBoxLayout()
+        pv.setSpacing(3)
+        pv.addWidget(self._preview_lbl)
+        self._preview_note = QtWidgets.QLabel("")
+        self._preview_note.setStyleSheet("color:#888; font-size:10px;")
+        self._preview_note.setFixedWidth(260)
+        self._preview_note.setWordWrap(True)
+        pv.addWidget(self._preview_note)
+        self._match_lbl = QtWidgets.QLabel("")
+        self._match_lbl.setStyleSheet("color:#e0a030; font-size:10px; font-weight:bold;")
+        self._match_lbl.setFixedWidth(260)
+        self._match_lbl.setWordWrap(True)
+        pv.addWidget(self._match_lbl)
+        pv.addStretch()
+        prev_row.addLayout(pv)
+        prev_row.addStretch()
+        self._preview_w = QtWidgets.QWidget()
+        self._preview_w.setLayout(prev_row)
+        lay.addWidget(self._preview_w)
+
         self._video_row = self._file_row("Video file:", "*.mp4 *.mkv *.avi *.mov", "video")
         lay.addWidget(self._video_row)
 
@@ -3375,7 +3555,7 @@ class StartupDialog(QtWidgets.QDialog):
         self._world_app_row = self._file_row(
             "World app:", "macOS app (*.app);;All files (*)", "world_app")
         self._world_data_row = self._file_row(
-            "World data:", "", "world_data", directory=True)
+            "World data:", "", "world_data", directory=True, start=str(worlds_dir()))
         # Auto-fill the renderer if we can find it (bundled, or the dev export).
         if not self._world_app_edit.text():
             wa = find_world_app()
@@ -3387,6 +3567,23 @@ class StartupDialog(QtWidgets.QDialog):
         if not saved_data or not Path(saved_data).exists():
             latest = find_latest_world()
             self._world_data_edit.setText(str(latest) if latest is not None else "")
+        # World app auto-detects and launch re-derives it if blank, so it's tucked
+        # behind an "Advanced" disclosure — you rarely need to touch it.
+        self._adv_btn = QtWidgets.QToolButton()
+        self._adv_btn.setText(" Advanced — renderer path")
+        self._adv_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._adv_btn.setArrowType(Qt.RightArrow)
+        self._adv_btn.setCheckable(True)
+        self._adv_btn.setChecked(False)
+        self._adv_btn.setStyleSheet("color:#888; border:none; padding:2px;")
+        self._adv_btn.toggled.connect(self._toggle_advanced)
+        adv_row = QtWidgets.QHBoxLayout()
+        adv_row.addSpacing(84)
+        adv_row.addWidget(self._adv_btn)
+        adv_row.addStretch()
+        self._adv_row_w = QtWidgets.QWidget()
+        self._adv_row_w.setLayout(adv_row)
+        lay.addWidget(self._adv_row_w)
         lay.addWidget(self._world_app_row)
         lay.addWidget(self._world_data_row)
 
@@ -3530,18 +3727,82 @@ class StartupDialog(QtWidgets.QDialog):
         brow.addWidget(go)
         lay.addLayout(brow)
 
+        # Live preview + world auto-link whenever the ride file or world changes.
+        self._tcx_edit.textChanged.connect(self._on_tcx_changed)
+        self._world_data_edit.textChanged.connect(lambda _t: self._update_preview())
+
         self._update_world_mode()
+        self._update_preview()
+
+    def _toggle_advanced(self, on):
+        self._adv_btn.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        if self.world_combo.currentIndex() == 1:
+            self._world_app_row.setVisible(on)
 
     def _update_world_mode(self):
         virtual = self.world_combo.currentIndex() == 1
         self._video_row.setVisible(not virtual)
-        self._world_app_row.setVisible(virtual)
+        self._adv_row_w.setVisible(virtual)
+        self._world_app_row.setVisible(virtual and self._adv_btn.isChecked())
         self._world_data_row.setVisible(virtual)
         self._bake_row_w.setVisible(virtual)
         self._virtual_hint.setVisible(virtual)
         self._peloton_row.setVisible(virtual)   # peloton exists only in the Godot world
         if virtual:
             self._refresh_virtual_state()
+        self._update_preview()
+
+    def _on_tcx_changed(self, _t=None):
+        # In a virtual ride, auto-fill World data with the world that matches this
+        # route (unless the current one already matches) — you pick the TCX and the
+        # world follows.
+        if self.world_combo.currentIndex() == 1:
+            tcx = self._tcx_edit.text().strip()
+            if tcx and Path(tcx).exists():
+                cur = self._world_data_edit.text().strip()
+                cur_ok = bool(cur) and Path(cur).exists() and bbox_match(
+                    _bbox_of(load_tcx_preview(tcx)[0]),
+                    world_route_bbox(cur)) >= WORLD_MATCH_MIN
+                if not cur_ok:
+                    w = find_world_for_route(tcx)
+                    if w is not None:
+                        self._world_data_edit.setText(str(w))  # re-triggers preview
+        self._update_preview()
+
+    def _update_preview(self):
+        if not hasattr(self, "_preview_lbl"):
+            return
+        tcx = self._tcx_edit.text().strip()
+        virtual = self.world_combo.currentIndex() == 1
+        self._match_lbl.setText("")
+        if not tcx or not Path(tcx).exists():
+            self._preview_lbl.setPixmap(QtGui.QPixmap())
+            self._preview_lbl.setText("route preview")
+            self._preview_note.setText("")
+            return
+        pts, km = load_tcx_preview(tcx)
+        if len(pts) < 2:
+            self._preview_lbl.setPixmap(QtGui.QPixmap())
+            self._preview_lbl.setText("no GPS in this TCX")
+            self._preview_note.setText(
+                "This ride file has no lat/lon — preview and world-match unavailable.")
+            return
+        wb, match = None, True
+        if virtual:
+            wd = self._world_data_edit.text().strip()
+            if wd and Path(wd).exists():
+                wb = world_route_bbox(wd)
+                if wb:
+                    match = bbox_match(_bbox_of(pts), wb) >= WORLD_MATCH_MIN
+        self._preview_lbl.setPixmap(render_route_pixmap(pts, world_bbox=wb, match=match))
+        note = f"{km:.1f} km · {len(pts)} GPS points"
+        if virtual and wb is not None:
+            note += " · green box = world coverage" if match else ""
+        self._preview_note.setText(note)
+        if virtual and wb is not None and not match:
+            self._match_lbl.setText(
+                "⚠ This world doesn't cover the selected route — positions won't "
+                "line up. Re-bake a world from this route, or pick the matching one.")
 
     def _refresh_virtual_state(self):
         """First-run nudge: with no baked world yet, steer the user to ‘Bake
@@ -3580,7 +3841,7 @@ class StartupDialog(QtWidgets.QDialog):
                 self._tcx_edit.setText(dlg.result_tcx)
             self._refresh_virtual_state()
 
-    def _file_row(self, label, filt, key, directory=False):
+    def _file_row(self, label, filt, key, directory=False, start=""):
         w   = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(w)
         row.setContentsMargins(0, 0, 0, 0)
@@ -3594,13 +3855,34 @@ class StartupDialog(QtWidgets.QDialog):
         btn.setFixedWidth(80)
 
         def browse():
+            # Start where the field already points (or its parent), else the
+            # supplied default. This lets Browse land straight inside the worlds
+            # folder — otherwise macOS's native panel hides ~/Library and there's
+            # no way to click through to it.
+            cur = edit.text().strip()
+            start_dir = start
+            if cur:
+                p = Path(cur)
+                if p.is_dir():
+                    start_dir = str(p)
+                elif p.parent.exists():
+                    start_dir = str(p.parent)
+            # Use Qt's own dialog with the Hidden filter so hidden folders
+            # (like ~/Library on macOS) are visible even if the user navigates up.
+            dlg = QtWidgets.QFileDialog(self, f"Select {label}", start_dir)
+            dlg.setOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog, True)
+            dlg.setFilter(dlg.filter() | QtCore.QDir.Filter.Hidden)
             if directory:
-                path = QtWidgets.QFileDialog.getExistingDirectory(self, f"Select {label}", "")
+                dlg.setFileMode(QtWidgets.QFileDialog.FileMode.Directory)
+                dlg.setOption(QtWidgets.QFileDialog.Option.ShowDirsOnly, True)
             else:
-                path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                    self, f"Select {label}", "", filt)
-            if path:
-                edit.setText(path)
+                dlg.setFileMode(QtWidgets.QFileDialog.FileMode.ExistingFile)
+                if filt:
+                    dlg.setNameFilter(filt)
+            if dlg.exec():
+                sel = dlg.selectedFiles()
+                if sel:
+                    edit.setText(sel[0])
 
         btn.clicked.connect(browse)
         row.addWidget(lbl)
@@ -3628,6 +3910,22 @@ class StartupDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self, "Missing", "World data folder not found — clear it or fix the path.")
             return
+        # Safeguard: a world that doesn't cover this route means the rider and the
+        # terrain won't line up. Warn (with the match score) rather than launch it.
+        if virtual and world_data and Path(world_data).exists():
+            wb = world_route_bbox(world_data)
+            if wb is not None and bbox_match(
+                    _bbox_of(load_tcx_preview(tcx)[0]), wb) < WORLD_MATCH_MIN:
+                r = QtWidgets.QMessageBox.question(
+                    self, "World doesn't match route",
+                    "The selected World data doesn't cover this TCX route, so the "
+                    "rider's position won't match the terrain.\n\nBake a world from "
+                    "this route (or pick the matching one) for a correct ride. "
+                    "Start anyway?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No)
+                if r != QtWidgets.QMessageBox.Yes:
+                    return
         # Virtual ride with no world data and no bundled fallback → the renderer
         # would open empty. Confirm rather than silently launch a blank world.
         if virtual and not world_data:
