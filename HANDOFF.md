@@ -6,6 +6,33 @@ don't sync, so this committed doc is how a fresh session (e.g. on the Windows
 PC) picks up the current state. `git pull`, open Claude in this repo, point it
 here.
 
+## Update — 2026-07-07 (READ THIS FIRST)
+
+Since the 2026-06-19 state below:
+- **`ride-sim-world` is now PUBLIC** (was private).
+- **New source commit `6f4cba6`** on `main` (pushed): macOS HUD screen-capture fix
+  (`WA_MacAlwaysShowToolWindow` at `ride_sim.py:~2096` — the `Qt.Tool` overlay is an
+  NSPanel that auto-hid whenever the app lost focus, so the HUD pills were missing from
+  OBS / screen recordings), plus a startup **Browse-hidden-worlds** fix and a **TCX route
+  preview + world auto-link** feature.
+- **mac `.dmg` REBUILT + install-tested + uploaded** to `v0.1.0-beta` (clobbered the old
+  asset; now ~345 MB — the current Jul-5 renderer carries the peloton/tree/avatar work).
+- **Marketing site is LIVE**: https://davedesign.com (Ubuntu 24.04 + nginx + Let's Encrypt;
+  deploy via `ssh davedesign` + `scp` to `/var/www/html`).
+
+### ⏳ The one open TODO — rebuild the Windows `.exe` on this PC
+The shipped `Ride.Sim-0.1.0-beta-windows-setup.exe` is still the **2026-06-19** build — it
+PREDATES commit `6f4cba6`, so it lacks the Browse fix + route preview (the HUD capture fix
+itself is macOS-only / a no-op on Windows). To refresh it:
+1. `git pull` in **both** repos (`ride-sim` and `ride-sim-world`, cloned side by side).
+2. Build per **"Build — Windows (on the PC)"** below.
+3. Clobber-upload, replacing the stale asset (keep the tag — YouTube video descriptions
+   hard-code `/releases/tag/v0.1.0-beta`):
+   ```
+   gh release upload v0.1.0-beta "dist\Ride Sim-0.1.0-beta-windows-setup.exe" --clobber
+   ```
+   The release is ALREADY published (not a draft) — just clobber-upload; do NOT bump the tag.
+
 ## Current state (2026-06-19)
 
 - **Repos** (must be cloned **side by side** — the spec reaches `../ride-sim-world`):
@@ -60,12 +87,13 @@ here.
 
 ## Publish the release (after the Windows build)
 
+`v0.1.0-beta` is **already published and live** (tag on `main`). To refresh an installer,
+clobber-upload the new asset — keep the same tag, since YouTube video descriptions link to
+`/releases/tag/v0.1.0-beta`:
 ```
-gh release upload v0.1.0-beta "dist/Ride Sim-0.1.0-beta-windows-setup.exe"
-gh release edit  v0.1.0-beta --draft=false
+gh release upload v0.1.0-beta "dist/Ride Sim-0.1.0-beta-windows-setup.exe" --clobber
 ```
-Publishing creates the `v0.1.0-beta` tag at `main`. Release notes live in
-`installer/release_notes_v0.1.0-beta.md`.
+Release notes live in `installer/release_notes_v0.1.0-beta.md`.
 
 ## Gotchas / hard-won notes
 
