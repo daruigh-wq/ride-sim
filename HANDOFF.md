@@ -17,21 +17,26 @@ Since the 2026-06-19 state below:
   preview + world auto-link** feature.
 - **mac `.dmg` REBUILT + install-tested + uploaded** to `v0.1.0-beta` (clobbered the old
   asset; now ~345 MB — the current Jul-5 renderer carries the peloton/tree/avatar work).
+- **Windows `.exe` REBUILT + uploaded** to `v0.1.0-beta` (clobbered the stale 2026-06-19
+  asset; now ~176 MB, built from `a65481a` + renderer `a466f2d` — carries the Browse fix +
+  route preview + the Jul-5 peloton/rider renderer). Both installers on the release are now
+  current.
 - **Marketing site is LIVE**: https://davedesign.com (Ubuntu 24.04 + nginx + Let's Encrypt;
   deploy via `ssh davedesign` + `scp` to `/var/www/html`).
 
-### ⏳ The one open TODO — rebuild the Windows `.exe` on this PC
-The shipped `Ride.Sim-0.1.0-beta-windows-setup.exe` is still the **2026-06-19** build — it
-PREDATES commit `6f4cba6`, so it lacks the Browse fix + route preview (the HUD capture fix
-itself is macOS-only / a no-op on Windows). To refresh it:
-1. `git pull` in **both** repos (`ride-sim` and `ride-sim-world`, cloned side by side).
-2. Build per **"Build — Windows (on the PC)"** below.
-3. Clobber-upload, replacing the stale asset (keep the tag — YouTube video descriptions
-   hard-code `/releases/tag/v0.1.0-beta`):
-   ```
-   gh release upload v0.1.0-beta "dist\Ride Sim-0.1.0-beta-windows-setup.exe" --clobber
-   ```
-   The release is ALREADY published (not a draft) — just clobber-upload; do NOT bump the tag.
+### ✅ No open build TODO
+Both the mac dmg and the Windows exe on `v0.1.0-beta` are up to date as of 2026-07-07. To
+refresh either installer in future, build per the OS-specific sections below and
+clobber-upload (keep the tag — YouTube video descriptions hard-code
+`/releases/tag/v0.1.0-beta`; the release is published, not a draft, so never bump the tag):
+```
+gh release upload v0.1.0-beta "dist\Ride Sim-0.1.0-beta-windows-setup.exe" --clobber
+```
+
+> **Godot isn't on `PATH` on the Windows PC.** The build commands below say `Godot ...`; the
+> actual editor is `C:\Users\Dave\godot-dl\editor\Godot_v4.6-stable_win64.exe` (use the
+> `..._console.exe` sibling for headless stdout). Either add it to `PATH` or substitute the
+> full path.
 
 ## Current state (2026-06-19)
 
