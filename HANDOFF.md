@@ -15,20 +15,27 @@ Since the 2026-06-19 state below:
   NSPanel that auto-hid whenever the app lost focus, so the HUD pills were missing from
   OBS / screen recordings), plus a startup **Browse-hidden-worlds** fix and a **TCX route
   preview + world auto-link** feature.
-- **mac `.dmg` REBUILT + install-tested + uploaded** to `v0.1.0-beta` (clobbered the old
-  asset; now ~345 MB — the current Jul-5 renderer carries the peloton/tree/avatar work).
-- **Windows `.exe` REBUILT + uploaded** to `v0.1.0-beta` (clobbered the stale 2026-06-19
-  asset; now ~176 MB, built from `a65481a` + renderer `a466f2d` — carries the Browse fix +
-  route preview + the Jul-5 peloton/rider renderer). Both installers on the release are now
-  current.
+- **mac `.dmg` REBUILT + install-tested + uploaded** to `v0.1.0-beta` — Jul-5 renderer with the
+  peloton/tree/avatar work, PLUS the **F11 / Shift+Enter fullscreen toggle + ⚙ Detail-panel
+  "Fullscreen" checkbox** (`ride-sim-world` commit `4ad8905`). Rebuilt + re-uploaded 17:21 PDT.
+- **Windows `.exe` rebuilt 16:15 PDT — but already one step behind.** It carries the Browse fix
+  + route preview + peloton *code*, BUT was built (a) 50 min before the avatar GLBs were staged
+  on the NAS (17:05) and (b) an hour before the F11 toggle was pushed (17:15). The GLBs are
+  gitignored → that export bundled NONE, so the pack still shows the procedural placeholder
+  ("old avatars"), and it has no F11 toggle. **NEEDS one more rebuild — see the TODO below.**
 - **Marketing site is LIVE**: https://davedesign.com (Ubuntu 24.04 + nginx + Let's Encrypt;
   deploy via `ssh davedesign` + `scp` to `/var/www/html`).
 
-### ✅ No open build TODO
-Both the mac dmg and the Windows exe on `v0.1.0-beta` are up to date as of 2026-07-07. To
-refresh either installer in future, build per the OS-specific sections below and
-clobber-upload (keep the tag — YouTube video descriptions hard-code
-`/releases/tag/v0.1.0-beta`; the release is published, not a draft, so never bump the tag):
+### ⏳ Open TODO — one more Windows rebuild (mac is current)
+The mac dmg is up to date (F11 + real avatars). The Windows exe is NOT — it predates both the
+avatar GLBs and the F11 toggle. On the PC:
+1. `git pull` **both** repos (brings `ride-sim-world` `4ad8905` = the F11 toggle + current Main.gd).
+2. **Copy the avatar GLBs** (gitignored → NOT in git): extract `male_opt.glb` + `female_opt.glb`
+   from `\\NAS2\nas share1\ride-sim\ride-sim-avatars-2026-07-07.zip` into
+   `ride-sim-world\godot\assets\`, then `Godot --headless --path godot --import`.
+3. Re-export the Windows renderer + `package_windows.bat`, then clobber-upload (keep the tag —
+   YouTube descriptions hard-code `/releases/tag/v0.1.0-beta`; the release is published, so
+   never bump the tag):
 ```
 gh release upload v0.1.0-beta "dist\Ride Sim-0.1.0-beta-windows-setup.exe" --clobber
 ```
