@@ -18,24 +18,25 @@ Since the 2026-06-19 state below:
 - **mac `.dmg` REBUILT + install-tested + uploaded** to `v0.1.0-beta` — Jul-5 renderer with the
   peloton/tree/avatar work, PLUS the **F11 / Shift+Enter fullscreen toggle + ⚙ Detail-panel
   "Fullscreen" checkbox** (`ride-sim-world` commit `4ad8905`). Rebuilt + re-uploaded 17:21 PDT.
-- **Windows `.exe` rebuilt 16:15 PDT — but already one step behind.** It carries the Browse fix
-  + route preview + peloton *code*, BUT was built (a) 50 min before the avatar GLBs were staged
-  on the NAS (17:05) and (b) an hour before the F11 toggle was pushed (17:15). The GLBs are
-  gitignored → that export bundled NONE, so the pack still shows the procedural placeholder
-  ("old avatars"), and it has no F11 toggle. **NEEDS one more rebuild — see the TODO below.**
+- **Windows `.exe` REBUILT + uploaded 18:03 PDT — now fully current.** Rebuilt with the avatar
+  GLBs (`.pck` grew 0.17 MB → 31.4 MB, confirming they're bundled) + the F11 toggle
+  (`ride-sim-world` `4ad8905`). Installer is ~204 MB; clobber-uploaded to `v0.1.0-beta`. Both
+  the mac dmg and the Windows exe on the release are now up to date.
+- **`package_windows.bat` version-extraction bug FIXED** (`ride-sim` `0226e0f`). It had failed
+  three Windows-only ways (cmd `for /f` paren-matching; cp1252 vs UTF-8 read; mangled escaped
+  quotes). The one-shot `\\NAS2\nas share1\ride-sim\build_windows_release.bat` now runs
+  end-to-end; see the Gotchas note at the bottom.
 - **Marketing site is LIVE**: https://davedesign.com (Ubuntu 24.04 + nginx + Let's Encrypt;
   deploy via `ssh davedesign` + `scp` to `/var/www/html`).
 
-### ⏳ Open TODO — one more Windows rebuild (mac is current)
-The mac dmg is up to date (F11 + real avatars). The Windows exe is NOT — it predates both the
-avatar GLBs and the F11 toggle. On the PC:
-1. `git pull` **both** repos (brings `ride-sim-world` `4ad8905` = the F11 toggle + current Main.gd).
-2. **Copy the avatar GLBs** (gitignored → NOT in git): extract `male_opt.glb` + `female_opt.glb`
-   from `\\NAS2\nas share1\ride-sim\ride-sim-avatars-2026-07-07.zip` into
-   `ride-sim-world\godot\assets\`, then `Godot --headless --path godot --import`.
-3. Re-export the Windows renderer + `package_windows.bat`, then clobber-upload (keep the tag —
-   YouTube descriptions hard-code `/releases/tag/v0.1.0-beta`; the release is published, so
-   never bump the tag):
+### ✅ No open build TODO — both installers current (F11 + real avatars)
+Both the mac dmg and the Windows exe on `v0.1.0-beta` are up to date as of 2026-07-07. To
+refresh the Windows installer in future, the easiest path is the one-shot script (now that
+`package_windows.bat` is fixed): run `\\NAS2\nas share1\ride-sim\build_windows_release.bat`
+(verify its 4 CONFIG paths first). It does all 6 steps — pull both repos, extract the avatar
+GLBs (gitignored → from `ride-sim-avatars-2026-07-07.zip`), Godot import, export the renderer,
+`package_windows.bat`, then clobber-upload (keeps the tag — YouTube descriptions hard-code
+`/releases/tag/v0.1.0-beta`; the release is published, so never bump the tag):
 ```
 gh release upload v0.1.0-beta "dist\Ride Sim-0.1.0-beta-windows-setup.exe" --clobber
 ```
@@ -125,3 +126,12 @@ Release notes live in `installer/release_notes_v0.1.0-beta.md`.
   tools with piped stdout/stderr, which on Windows default to cp1252 and raise
   `UnicodeEncodeError` on any non-ASCII output (e.g. the `→`/`✓` progress lines).
   `main()` forces UTF-8 on those streams; don't remove that.
+- **`package_windows.bat` APP_VERSION extraction is Windows-fragile** (fixed in
+  `0226e0f` — don't regress it). Three cmd/Windows traps, all of which made the
+  build die at the package step with `.read() was unexpected at this time`:
+  (1) don't put the `python -c` inside a `for /f (...)` block — cmd paren-matches
+  the block and the `()` in the Python break it (redirect to a temp file +
+  `set /p` instead); (2) read `ride_sim.py` as `encoding='utf-8'` — Windows
+  `open()` defaults to cp1252 and chokes on its non-ASCII bytes; (3) use **no
+  double-quotes inside** the `-c "..."` arg (parse via `chr(34)` + single quotes)
+  — cmd's arg parser mangles escaped quotes so the regex matched nothing.
