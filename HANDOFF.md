@@ -6,7 +6,27 @@ don't sync, so this committed doc is how a fresh session (e.g. on the Windows
 PC) picks up the current state. `git pull`, open Claude in this repo, point it
 here.
 
-## Update — 2026-07-07 (READ THIS FIRST)
+## Update — 2026-07-10 (READ THIS FIRST)
+
+The Windows `.exe` was rebuilt on the PC (real avatars now correct), but the **F11 /
+Shift+Enter fullscreen toggle still didn't work**: it *flashed windowed once and snapped
+back to fullscreen*. Root cause (NOT a stale build — input was reaching the handler, the
+Detail-panel checkbox flipped): the world window is **born fullscreen** (`project.godot
+window/size/mode=Fullscreen`), so on Windows it has no saved windowed rect — switching to
+`WINDOW_MODE_WINDOWED` got size 0 / an invalid position and the compositor snapped it back.
+
+**FIX committed `ride-sim-world 6efdb5f`** (`godot/Main.gd _set_fullscreen`): when leaving
+fullscreen, explicitly assign a centered rect (85% of the current screen's usable area) so
+windowed mode sticks. Verified it parses clean under Godot 4.6.3 (`--check-only`), but it is
+**untested on Windows** (can't test a Windows build from the Mac).
+
+⏳ **The Windows `.exe` needs ONE more rebuild** to include `6efdb5f`. `git pull ride-sim-world`
+on the PC, re-export the renderer + `package_windows.bat`, clobber-upload. Avatars are already
+correct in the current build, so this is purely to pick up the fullscreen fix. Best done from a
+**Claude Code session running on the PC** so it can rebuild AND launch the exe to confirm F11
+actually toggles (and tweak — e.g. `call_deferred` the size set — if his compositor still fights it).
+
+## Update — 2026-07-07
 
 Since the 2026-06-19 state below:
 - **`ride-sim-world` is now PUBLIC** (was private).
@@ -29,8 +49,10 @@ Since the 2026-06-19 state below:
 - **Marketing site is LIVE**: https://davedesign.com (Ubuntu 24.04 + nginx + Let's Encrypt;
   deploy via `ssh davedesign` + `scp` to `/var/www/html`).
 
-### ✅ No open build TODO — both installers current (F11 + real avatars)
-Both the mac dmg and the Windows exe on `v0.1.0-beta` are up to date as of 2026-07-07. To
+### ⚠️ SUPERSEDED by the 2026-07-10 update above — Windows exe needs one more rebuild
+(This section was written 2026-07-07 before the F11 fullscreen bug surfaced. The mac dmg is
+still current; the **Windows exe is NOT** — it needs `ride-sim-world 6efdb5f`. See the top.)
+Both the mac dmg and the Windows exe on `v0.1.0-beta` were up to date as of 2026-07-07. To
 refresh the Windows installer in future, the easiest path is the one-shot script (now that
 `package_windows.bat` is fixed): run `\\NAS2\nas share1\ride-sim\build_windows_release.bat`
 (verify its 4 CONFIG paths first). It does all 6 steps — pull both repos, extract the avatar
