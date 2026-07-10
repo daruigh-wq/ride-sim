@@ -31,8 +31,10 @@ buttons to click) is in [USAGE.md → Installing](../USAGE.md#installing).
 Short version:
 
 - **Windows:** SmartScreen → *More info* → *Run anyway*
-- **macOS:** drag **Ride Sim** to Applications, then right-click it → *Open*
-  → *Open* (needed once, because the app isn't notarized)
+- **macOS:** drag **Ride Sim** to Applications, then double-click it. macOS blocks
+  it (*"Apple could not verify… is free of malware"*, **Move to Trash** / **Done**) —
+  click **Done**, then go to **System Settings → Privacy & Security → Open Anyway**
+  (needed once, because the app isn't notarized)
 
 ## New in this build: ride a 3D virtual world
 

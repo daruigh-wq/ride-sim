@@ -51,8 +51,9 @@ previous TCX recording — and an AR **pacer cube** painted in the video.
 
 ### macOS
 1. Open `Ride Sim-<version>-mac.dmg`. Drag **Ride Sim.app** to the **Applications** folder shortcut shown in the DMG window.
-2. **First launch — Gatekeeper warning.** Open **Applications** in Finder. Double-clicking **Ride Sim** the normal way will show *"Ride Sim cannot be opened because the developer cannot be verified."* with only a **Cancel** button (or **Move to Trash** on newer macOS). Click **Cancel**.
-3. Now **right-click** (or Control-click) **Ride Sim** in Applications → **Open**. The same dialog reappears, but this time it has an **Open** button. Click **Open**. macOS will remember this for all future launches — you only need the right-click dance once.
+2. **First launch — Gatekeeper block.** Open **Applications** in Finder and double-click **Ride Sim**. Because the app isn't notarized, macOS blocks it: *"Ride Sim Not Opened — Apple could not verify 'Ride Sim' is free of malware…"* with only **Move to Trash** and **Done**. Click **Done** — do **not** move it to Trash.
+3. Open **System Settings → Privacy & Security** and scroll down to the **Security** section. You'll see *"'Ride Sim' was blocked to protect your Mac."* Click **Open Anyway**, authenticate (Touch ID / password), and click **Open Anyway** once more in the confirmation dialog. macOS remembers this — you only do it once. (On **older** macOS the classic **right-click → Open** trick also works, but "Open Anyway" works everywhere.)
+   - *Terminal alternative (advanced):* `xattr -dr com.apple.quarantine "/Applications/Ride Sim.app"`, then double-click normally. This strips the download-quarantine flag that triggers the block.
 4. **Bluetooth permission prompt.** On first run, macOS asks for permission to use Bluetooth. **Allow it** — the app cannot find your trainer otherwise. If you refuse, you can re-enable it in **System Settings → Privacy & Security → Bluetooth**.
 
 ### Windows
