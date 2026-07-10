@@ -44,6 +44,15 @@ unaffected by these Windows-monitor issues but should pull the `ride_sim.py` cha
 cross-platform: the coordinate normalization is a no-op when the primary sits at the origin, and the
 quality picker works everywhere.
 
+**mac `.dmg` REBUILT + clobber-uploaded on the Mac (2026-07-10, from `afa7253`).** Re-exported the
+macOS renderer at `6efdb5f` + ad-hoc signed it, then `package_mac.sh` → 362 MB dmg. Install-tested
+(mounts, BT plist key present, nested renderer ad-hoc-signed, launches clean — no SIGKILL, only the
+benign "Sans-serif" font-alias warning). Both installers on `v0.1.0-beta` are now current at
+`afa7253` / renderer `6efdb5f`. **Tag `v0.1.0-beta` moved to `afa7253`** (was frozen at June-19
+`3eac15b`, so the release's auto "Source code (zip)" was 3+ weeks stale even though the installers
+were fresh) — tag *name*/URL unchanged, so YouTube links still resolve; only the source snapshot
+refreshed.
+
 ## Update — 2026-07-07
 
 Since the 2026-06-19 state below:
