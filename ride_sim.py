@@ -3680,6 +3680,37 @@ class StartupDialog(QtWidgets.QDialog):
         self._peloton_row = pel_w
         lay.addWidget(pel_w)
 
+        # World render quality (Godot world rides only). The world otherwise defaults
+        # to its heaviest tier ("high": native-res + 4x MSAA + tree shadows + 12km
+        # draw), which can swamp a GPU at 4K. Expose a per-ride picker that trades
+        # detail for frame rate → RIDESIM_WORLD_QUALITY. (In-ride, 1/2/3 keys and the
+        # ⚙ render-scale slider also switch tiers live.) See world _init_quality().
+        qual_w = QtWidgets.QWidget()
+        qual_row = QtWidgets.QHBoxLayout(qual_w)
+        qual_row.setContentsMargins(0, 0, 0, 0)
+        qual_lbl = QtWidgets.QLabel("World detail:")
+        qual_lbl.setFixedWidth(90)
+        self.world_quality = QtWidgets.QComboBox()
+        self._world_qualities = [
+            ("Low — fastest (½-res, no shadows)", "low"),
+            ("Medium — balanced (¾-res, 2× MSAA)", "medium"),
+            ("High — best-looking (native, 4× MSAA; strong GPUs)", "high")]
+        for label, _key in self._world_qualities:
+            self.world_quality.addItem(label)
+        _saved_q = str(self._last.get("world_quality", "medium"))
+        _q_idx = next((i for i, (_l, k) in enumerate(self._world_qualities)
+                       if k == _saved_q), 1)   # default → Medium
+        self.world_quality.setCurrentIndex(_q_idx)
+        self.world_quality.setToolTip(
+            "Render detail for the Godot world. Higher looks better but costs frame "
+            "rate — at 4K, Medium is the sweet spot on most GPUs. Change it live in "
+            "the ride with the 1/2/3 keys or the ⚙ panel.")
+        qual_row.addWidget(qual_lbl)
+        qual_row.addWidget(self.world_quality)
+        qual_row.addStretch()
+        self._quality_row = qual_w
+        lay.addWidget(qual_w)
+
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Video offset (s):"))
         self.offset_spin = QtWidgets.QDoubleSpinBox()
@@ -3748,6 +3779,7 @@ class StartupDialog(QtWidgets.QDialog):
         self._bake_row_w.setVisible(virtual)
         self._virtual_hint.setVisible(virtual)
         self._peloton_row.setVisible(virtual)   # peloton exists only in the Godot world
+        self._quality_row.setVisible(virtual)   # detail tier applies to the Godot world only
         if virtual:
             self._refresh_virtual_state()
         self._update_preview()
@@ -3958,6 +3990,7 @@ class StartupDialog(QtWidgets.QDialog):
                            if (virtual and self.peloton_cb.isChecked()) else 0),
             "peloton_level": self._peloton_levels[self.peloton_level.currentIndex()][1],
             "peloton_free": self.peloton_free_cb.isChecked(),
+            "world_quality": self._world_qualities[self.world_quality.currentIndex()][1],
         }
         self.accept()
 
@@ -4053,7 +4086,7 @@ def place_main_window(win, screen):
 
 def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None,
                           peloton_n: int = 0, peloton_level: str = "",
-                          peloton_free: bool = False):
+                          peloton_free: bool = False, world_quality: str = ""):
     """
     Launch the exported RideSimWorld renderer for a virtual ride and point it at
     the baked world via the RIDESIM_WORLD_DIR env var (the renderer reads its data
@@ -4095,6 +4128,12 @@ def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None
         # Free pace: pack rides its own pace and drops you (env wins for dev).
         free_env = os.environ.get("RIDESIM_PELOTON_FREE", "").strip()
         env["RIDESIM_PELOTON_FREE"] = free_env if free_env else ("1" if peloton_free else "0")
+    # World render-detail tier (low|medium|high) → RIDESIM_WORLD_QUALITY. Unset lets
+    # the world use its own default. A terminal-set env var wins (dev/benchmark).
+    q = (os.environ.get("RIDESIM_WORLD_QUALITY", "").strip()
+         or (world_quality or "").strip().lower())
+    if q in ("low", "medium", "high"):
+        env["RIDESIM_WORLD_QUALITY"] = q
     try:
         proc = subprocess.Popen([str(binp)], env=env)
         extra = f"  RIDESIM_PELOTON_N={pelo}" if pelo else ""
@@ -4161,6 +4200,7 @@ def main():
         "peloton_n":  cfg.get("peloton_n", 0),
         "peloton_level": cfg.get("peloton_level", "cat3"),
         "peloton_free": cfg.get("peloton_free", False),
+        "world_quality": cfg.get("world_quality", "medium"),
     })
 
     try:
@@ -4182,14 +4222,28 @@ def main():
     if cfg.get("virtual"):
         state.video_lock = True
         cockpit_screen, world_screen = pick_ride_screens(app)
-        world_pos = (world_screen.geometry().center()
-                     if world_screen is not None and world_screen is not cockpit_screen
-                     else None)
+        world_pos = None
+        if world_screen is not None and world_screen is not cockpit_screen:
+            # The world gets a point inside its target monitor; Main.gd fullscreens
+            # the screen containing it. Qt reports monitor coords in the OS virtual
+            # desktop, where a monitor sitting left/above the primary has NEGATIVE
+            # coords — but Godot normalizes so the desktop's top-left corner is (0,0).
+            # Translate the hint into Godot's space by subtracting the Qt virtual-
+            # desktop origin, else the point can land on the WRONG monitor and the
+            # world fullscreens there. (Seen on a dual-monitor box: NVIDIA 1440p at
+            # Qt x=-2560 → Godot x=0, so a 4K-center hint at Qt x=1920 fell on the
+            # 1440p in Godot space.) Assumes uniform display scaling (no per-monitor
+            # HiDPI mismatch between Qt logical points and Godot physical pixels).
+            origin_x = min(s.geometry().x() for s in app.screens())
+            origin_y = min(s.geometry().y() for s in app.screens())
+            c = world_screen.geometry().center()
+            world_pos = QtCore.QPoint(c.x() - origin_x, c.y() - origin_y)
         godot_proc = launch_world_renderer(
             cfg.get("world_app", ""), cfg.get("world_data", ""),
             world_screen_pos=world_pos, peloton_n=cfg.get("peloton_n", 0),
             peloton_level=cfg.get("peloton_level", ""),
-            peloton_free=cfg.get("peloton_free", False))
+            peloton_free=cfg.get("peloton_free", False),
+            world_quality=cfg.get("world_quality", ""))
     # Stash route geometry for the curved-centerline tangent renderer. NaN-fill
     # missing lat/lon entries so downstream code can use np.isfinite() masks.
     _lat_arr = _np.asarray([(v if v is not None else math.nan) for v in lat], dtype=float)

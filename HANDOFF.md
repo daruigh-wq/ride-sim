@@ -8,24 +8,41 @@ here.
 
 ## Update — 2026-07-10 (READ THIS FIRST)
 
-The Windows `.exe` was rebuilt on the PC (real avatars now correct), but the **F11 /
-Shift+Enter fullscreen toggle still didn't work**: it *flashed windowed once and snapped
-back to fullscreen*. Root cause (NOT a stale build — input was reaching the handler, the
-Detail-panel checkbox flipped): the world window is **born fullscreen** (`project.godot
-window/size/mode=Fullscreen`), so on Windows it has no saved windowed rect — switching to
-`WINDOW_MODE_WINDOWED` got size 0 / an invalid position and the compositor snapped it back.
+**F11 is fixed for real now — but the true root cause was NOT the one first suspected, and an
+earlier "DONE" note today (since removed) was wrong on multi-monitor rigs. Accurate account:**
 
-**FIX committed `ride-sim-world 6efdb5f`** (`godot/Main.gd _set_fullscreen`): when leaving
-fullscreen, explicitly assign a centered rect (85% of the current screen's usable area) so
-windowed mode sticks. Verified it parses clean under Godot 4.6.3 (`--check-only`), but it is
-**untested on Windows** (can't test a Windows build from the Mac).
+The `6efdb5f` renderer fix (assign an explicit centered 85% rect when leaving fullscreen) is
+correct and necessary, but on the Windows PC F11 still appeared to do nothing. Why: the PC is a
+**dual-monitor rig** — a 4K Samsung (**primary**, Windows virtual-desktop x=0) and a 1440p LG
+(**secondary**, x=**−2560**), **both driven by the NVIDIA Quadro RTX 4000** (the Intel iGPU is
+headless — confirmed via dxdiag). ride_sim launches the world with a monitor hint
+(`RIDESIM_WORLD_SCREEN_POS`) = a point inside the intended (largest) screen, in **Qt/Windows
+coords**. But **Godot normalizes multi-monitor coords so the desktop top-left is (0,0)** — the 4K
+sits at Godot x=**2560**, so a 4K-center hint (Qt x≈1920) landed on the **1440p** in Godot's space.
+The world opened fullscreen on the **secondary** monitor, and `WINDOW_MODE_WINDOWED` does not
+cleanly exit on a non-primary display there (it lands in `EXCLUSIVE_FULLSCREEN`, mode 4, and the
+resize is dropped) — that is the "F11 does nothing" the user saw. On the primary 4K the *same* code
+toggles perfectly.
 
-✅ **DONE 2026-07-10 (PC session): the Windows `.exe` is now current with the fullscreen fix.**
-Rebuilt on the PC from `ride-sim-world 6efdb5f` (renderer re-exported + `package_windows.bat`) and
-clobber-uploaded to `v0.1.0-beta`. F11 verified working on Windows 11: leaving fullscreen drops the
-world window to a centered 85% rect (3264×1836 on the 4K panel) and it **stays** — no snap-back —
-and F11 again returns to fullscreen. The `call_deferred` tweak was **not** needed (`window_set_size`
-stuck immediately). Both installers on the release are now current (avatars + F11).
+**REAL FIX — `ride-sim` `ride_sim.py` (this commit):** normalize the screen hint into Godot's
+coordinate space (subtract the Qt virtual-desktop origin: `min(screen.geometry().x/y)`) so the world
+lands on the intended largest screen (the 4K/primary), where F11 works. Verified **end-to-end** on
+the PC: a SIM ride opens the world fullscreen at (0,0) on the 4K; F11 drops it to a centered
+3264×1836 window and back. (The exclusive-fullscreen-exit bug on a *secondary* monitor was NOT
+solved — we route around it. Assumes uniform display scaling; a per-monitor HiDPI mismatch between
+Qt logical points and Godot physical pixels would need a scale factor.)
+
+**Also added — `ride_sim.py`:** a per-ride **"World detail" picker** (Low / Medium / High, default
+**Medium**) in the ride-setup dialog → `RIDESIM_WORLD_QUALITY`. The world otherwise defaults to
+"high" (native-res + 4× MSAA + ~51k tree shadows + 12 km draw), brutal at 4K on the RTX 4000;
+Medium (¾-res FSR + 2× MSAA) holds a solid 60 fps. In-ride `1`/`2`/`3` keys + the ⚙ render-scale
+slider still switch tiers live. (ride_sim had never set the quality env, so every ride ran "high".)
+
+**Windows `.exe` rebuilt + clobber-uploaded to `v0.1.0-beta`** with the clean `6efdb5f` renderer +
+the new `ride_sim.py`. The renderer (`ride-sim-world`) is unchanged at `6efdb5f`. The mac dmg is
+unaffected by these Windows-monitor issues but should pull the `ride_sim.py` changes — they are
+cross-platform: the coordinate normalization is a no-op when the primary sits at the origin, and the
+quality picker works everywhere.
 
 ## Update — 2026-07-07
 
