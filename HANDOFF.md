@@ -20,11 +20,12 @@ fullscreen, explicitly assign a centered rect (85% of the current screen's usabl
 windowed mode sticks. Verified it parses clean under Godot 4.6.3 (`--check-only`), but it is
 **untested on Windows** (can't test a Windows build from the Mac).
 
-⏳ **The Windows `.exe` needs ONE more rebuild** to include `6efdb5f`. `git pull ride-sim-world`
-on the PC, re-export the renderer + `package_windows.bat`, clobber-upload. Avatars are already
-correct in the current build, so this is purely to pick up the fullscreen fix. Best done from a
-**Claude Code session running on the PC** so it can rebuild AND launch the exe to confirm F11
-actually toggles (and tweak — e.g. `call_deferred` the size set — if his compositor still fights it).
+✅ **DONE 2026-07-10 (PC session): the Windows `.exe` is now current with the fullscreen fix.**
+Rebuilt on the PC from `ride-sim-world 6efdb5f` (renderer re-exported + `package_windows.bat`) and
+clobber-uploaded to `v0.1.0-beta`. F11 verified working on Windows 11: leaving fullscreen drops the
+world window to a centered 85% rect (3264×1836 on the 4K panel) and it **stays** — no snap-back —
+and F11 again returns to fullscreen. The `call_deferred` tweak was **not** needed (`window_set_size`
+stuck immediately). Both installers on the release are now current (avatars + F11).
 
 ## Update — 2026-07-07
 
