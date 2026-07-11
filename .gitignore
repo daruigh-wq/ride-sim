@@ -61,3 +61,7 @@ scripts/out/
 scripts/yaw_tune.py
 scripts/curve_smoke.py
 scripts/reframe_360.sh
+
+# Motor/IMU R&D archive — local reference only (ChatGPT transcript, vendor PDFs,
+# spec images). Durable with the project but NOT for the public repo.
+research/
