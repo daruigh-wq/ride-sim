@@ -152,10 +152,16 @@ Crop + per-face rotate the two tracks into ffmpeg's standard EAC face order; val
 ### Step 3 — Productionize the reframe  ✅ v1 BUILT 2026-07-13 (`research/reframe.py`)
 `reframe.py IN.360 [OUT.mp4]` — extracts gpmd from the `.360`, decodes **GPS9 route + CORI + GRAV**,
 renders a road-following pinhole clip + `OUT.route.npz` sidecar. `--validate` burns the ride_sim
-overlay for QC. **KEY DESIGN — LOCAL fusion only** (CORI & GPS are each reliable only *locally*;
-a global absolute-frame fit is fragile — CORI heading drifts vs GPS, they diverged −169° vs −43°
-cumulative over this clip even though they agree in any ~10 s window, and GPS course-over-ground
-goes garbage at the 9% stopped samples):
+overlay for QC. **KEY DESIGN — LOCAL fusion** (chosen for simplicity/robustness, not because the sensors disagree —
+see correction). CORRECTION 2026-07-13: my first cut claimed CORI heading "drifts −169° vs GPS −43°"
+— that was an ANALYSIS BUG: GPS course-over-ground was computed by differentiating position WITHOUT
+speed-gating, so the stationary start (first ~10 s) and the single end stop (~last 10 s) — the ONLY
+slow parts; the rider blew every stop sign and held 5–7 m/s through the whole middle (0% slow
+20–160 s) — corrupted the COG unwrap. **Speed-gated, CORI and GPS heading agree the whole ride** to a
+gentle −0.07°/s ramp (~13° over 3 min) plus COG-noise spikes at the corners (`drift_diag.png`). CORI
+yaw genuinely has no fiducial (magnetometer not fused → gyro-integral, drifts) but only mildly here;
+pitch/roll ARE gravity-anchored (drift-free). Net: **speed-gate GPS COG; CORI drift is minor.** Local
+fusion is still the clean choice (drift-immune, no global unwrap to get right):
 - **Video = pure CORI road-follow**: `applied = cori_head − lp(cori_head, τ)` — a local high-pass,
   bounded everywhere regardless of drift. No GPS in the video yaw (injecting the drifted GPS frame
   made `applied` blow up to ±260°). GRAV de-roll, pitch 0, FOV 130.
