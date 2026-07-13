@@ -23,6 +23,19 @@ def decode(payload, typ, esize, n):
         return [payload.rstrip(b'\x00 ').decode('latin1', 'replace')]
     return []
 
+def decode_complex(payload, typefmt, ssize):
+    """Decode a '?' complex stream (e.g. GPS9 'lllllllSS') into a flat list of
+    len(typefmt)*repeat numbers, per the sibling TYPE format string."""
+    per = [(UNPACK[c], struct.calcsize('>'+UNPACK[c])) for c in typefmt if c in UNPACK]
+    if len(per) != len(typefmt) or not ssize:
+        return []
+    out = []
+    for base in range(0, len(payload) - ssize + 1, ssize):
+        off = base
+        for u, sz in per:
+            out.append(struct.unpack('>'+u, payload[off:off+sz])[0]); off += sz
+    return out
+
 def walk(buf, off, end, depth, ctx, out):
     while off + 8 <= end:
         key = buf[off:off+4].decode('latin1')
@@ -41,14 +54,16 @@ def walk(buf, off, end, depth, ctx, out):
         # leaf: stash modifiers / data in current stream scope
         if key == 'STNM': ctx['STNM'] = decode(payload, 'c', 1, repeat)[0] if payload else ''
         elif key == 'SIUN' or key == 'UNIT': ctx['UNIT'] = decode(payload, 'c', 1, repeat)[0] if payload else ''
+        elif key == 'TYPE': ctx['TYPE'] = payload.rstrip(b'\x00 ').decode('latin1','replace')
         elif key == 'SCAL':
             ctx['SCAL'] = decode(payload, typ, TYPE_SIZE.get(typ,1), repeat)
         elif key == 'TSMP': ctx['TSMP'] = decode(payload, typ, 4, repeat)
         elif key == 'DVNM': out_dvnm(ctx, payload)
         elif key not in ('TICK','TOCK','TIMO','EMPT','TSMP','STMP','TYPE','ORIN','ORIO',
                          'MTRX','FMWR','DVID','VERS','GPSU','GPSF','GPSP','GPSA','STPS','KLV5'):
-            # treat as the stream's data key if it carries numeric samples
-            if typ in TYPE_SIZE and typ != 'c':
+            # treat as the stream's data key if it carries numeric samples.
+            # '?' = complex type (e.g. GPS9), decoded via the sibling TYPE string.
+            if (typ in TYPE_SIZE or typ == '?') and typ != 'c':
                 cur = ctx.get('_data')            # data leaf = the one with the MOST
                 if cur is None or repeat > cur[3]:  # samples (beats embedded TMPC etc.)
                     ctx['_data'] = (key, typ, ssize, repeat, payload)
@@ -65,11 +80,15 @@ def main(path, duration):
     for s in streams:
         key, typ, ssize, repeat, payload = s['_data']
         a = agg.setdefault(key, {'typ':typ,'ssize':ssize,'samples':0,'STNM':s.get('STNM',''),
-                                 'UNIT':s.get('UNIT',''),'SCAL':s.get('SCAL'),'first':None})
+                                 'UNIT':s.get('UNIT',''),'SCAL':s.get('SCAL'),'TYPE':s.get('TYPE'),'first':None})
         a['samples'] += repeat
         if a['first'] is None and payload:
-            esize = TYPE_SIZE.get(typ,1); axes = max(1, ssize//esize)
-            vals = decode(payload[:ssize], typ, esize, axes)
+            if typ == '?' and s.get('TYPE'):
+                vals = decode_complex(payload[:ssize], s['TYPE'], ssize)
+                axes = len(vals)
+            else:
+                esize = TYPE_SIZE.get(typ,1); axes = max(1, ssize//esize)
+                vals = decode(payload[:ssize], typ, esize, axes)
             a['first'] = vals
             a['axes'] = axes
     print(f"\n=== GPMF inventory: {path}  (clip {duration:.1f}s) ===")

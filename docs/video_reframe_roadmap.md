@@ -124,13 +124,26 @@ in `research/`, reuse `eqf/`). `turn_register.py` = earlier csv-bearing version,
   the reframe yaw and the overlay route from the SAME CORI heading so they're timed-consistent.
   The committed `GS010004_yaw_gps.csv` (likely magnetometer) has a timing/source mismatch that
   swings the centerline — do NOT use it for this.
-- **Centerline through the sharp turn: app-data-gated.** Exact on straights; approximate through
-  the corner because GS0004 has **NO GPS** (no true positions/speed) — the route is reconstructed
-  from heading integrated at a guessed speed V (≈6–8 m/s here), which can't reproduce a corner
-  where speed varies and the rider cuts the line. **In the app the loaded TCX gives true positions
-  → the centerline registers by construction.** (V-tuning also estimates ride speed as a bonus.)
-- **⚠ APP ACTION when productionizing:** set `ride_sim.py:829 video_fov_h_deg` from `118.8`
+- **GS0004 HAS GPS after all (correction).** Earlier "no GPS" was WRONG — a `gpmf_inventory.py`
+  bug: it dropped GoPro's **GPS9** compound (`'?'`) type, so the extracted bin looked GPS-less. The
+  `.360` carries **GPS9 @10 Hz**, real coords (San Jose 37.32,−121.93), 3D fix, **mean 5.14 m/s**
+  (window 6.2). Fixed the walker (see below). `gps_register.py` builds the route from the real track.
+  **Big consequence: a GoPro `.360` carries its OWN route — "drop your .360" yields video AND route,
+  no external TCX needed** (external TCX still supported for non-GoPro footage).
+- **Centerline through the sharp turn: heading-fusion, not missing data.** With the real GPS route the
+  near centerline sits on the road; through the messy intersection the raw 10 Hz GPS *bearing* is
+  noisy (differentiating ±2–3 m position noise) and disagrees with CORI by ~8° at the apex (applied
+  residual ±8.6° vs ±3° CORI-only). Time lag is negligible (0.07 s). Fix = **fuse**: smooth-GPS (or
+  1 Hz-like) for the slow road shape + drift-free CORI for high-rate heading; drive reframe yaw and
+  overlay route from the SAME fused heading. Not yet built — the productionization step.
+- **⚠ APP ACTIONS when productionizing:** (1) set `ride_sim.py:829 video_fov_h_deg` from `118.8`
   (POLY-calibrated to the old GoPro export) to the owned-reframe FOV (130), else it misregisters.
+  (2) pull the route straight from the `.360` GPS9 for GoPro rides.
+
+### Step 1.6 — gpmf_inventory GPS9 fix  ✅ DONE 2026-07-13 (committed, public tool)
+`tools/gpmf_inventory.py` now decodes GPMF `'?'` complex streams (GPS9, FACE) via the sibling
+`TYPE` format string (`decode_complex`, capture `TYPE`, allow `'?'` as a data leaf). Verified GPS9
+→ `[37.3206, −121.9267, 24.4 m, …, DOP 3.24, fix 3]`. Legacy GPS5 unaffected (only added `'?'` path).
 
 ### Step 2 — Fix de-EAC seams (polish, low priority)
 Crop + per-face rotate the two tracks into ffmpeg's standard EAC face order; validate against
