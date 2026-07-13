@@ -188,9 +188,19 @@ GPS9 (lat/lon/alt/dist), which loads through the existing `load_tcx_route` (veri
   FOV = 130, camera height 1.0 m** (the tool prints this line). FOV is the persisted runtime setting
   (Settings, `ride_sim.py:2791`) — left the 118.8 default alone so existing GoPro-Player exports still
   register; set 130 per reframed video.
+- **v_fov STRETCH BUG — fixed 2026-07-13.** First full-ride demo render looked "too tall" (user caught
+  it in-app). Cause: rectilinear `v_fov` relates to `h_fov` through **tan**, not linearly — I'd used
+  `v_fov = fov*H/W` (=73.1° at 1024×576) instead of `2*atan(tan(h_fov/2)*H/W)` (=100.7°) → non-square
+  pixels → **1.63× vertical stretch**. ride_sim `_project` assumes square pixels, so this also threw off
+  vertical registration (why the earlier tests needed cam_h fiddling). Fixed in `tools/reframe.py`; same
+  bug still in the research scripts (`build_stab_fbf.py`, `gps_register.py` — gitignored, not shipped).
+  **Roll & pitch verified OK** on the deployed file (horizon level+centered even at the +25° max-roll
+  frame; GRAV de-roll lands, pitch=0 is correct — adding pitch-leveling made it worse). See
+  [[feedback_verify_reframe_in_app]]. Renamed the equirect intermediate (`__equirect_tmp.mp4`, deleted
+  after frame dump) so it can't be confused with the real output.
 - **Known limits / future:** frame-by-frame PNG intermediates are disk-heavy on a full ride (~3 MB ×
-  30 fps); a future pass should pipe frames instead. A deeper integration ("Import .360…" menu that
-  calls reframe.py, auto-sets FOV) and the live GLSL shader path remain. `--validate` burns the overlay.
+  30 fps → ~24 GB); a future pass should pipe frames instead. A deeper integration ("Import .360…" menu
+  that calls reframe.py, auto-sets FOV) and the live GLSL shader path remain. `--validate` burns the overlay.
 
 ### Step 4 — Re-test overlay registration
 With an owned pinhole + sim-yaw video, the existing `_project` / `_draw_cube` / `_draw_tangent_line`

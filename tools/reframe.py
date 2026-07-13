@@ -38,7 +38,11 @@ ap.add_argument("--tau-road", type=float, default=0.7); ap.add_argument("--speed
 ap.add_argument("--sgn", type=float, default=1.0); ap.add_argument("--yaw-off", type=float, default=0.0)
 ap.add_argument("--reuse-eqf", action="store_true"); ap.add_argument("--validate", action="store_true")
 A = ap.parse_args()
-FPS=30; W,H=1024,576; VFOV=round(A.fov*H/W,1); EQW,EQH=2880,1440; GAP,SIZE=5.0,1.0
+FPS=30; W,H=1024,576; EQW,EQH=2880,1440; GAP,SIZE=5.0,1.0
+# Rectilinear v_fov relates to h_fov through tan (NOT the linear fov*H/W): using the linear
+# form makes v360 render non-square pixels — a ~1.63x vertical stretch ("too tall"). This is
+# also what ride_sim `_project` assumes (single f_px from h_fov), so square pixels == registers.
+VFOV=round(2*math.degrees(math.atan(math.tan(math.radians(A.fov)/2)*H/W)),1)
 BASE = os.path.splitext(A.out)[0]
 
 def run(c): subprocess.run(c, check=True)
@@ -139,9 +143,11 @@ tcx=BASE+".tcx"; write_tcx(tcx)
 nfr=int(DUR*FPS); f0=int(T0*FPS)
 if not (A.reuse_eqf and os.path.isdir("eqf")):
     shutil.rmtree("eqf",ignore_errors=True); os.makedirs("eqf")
+    eqtmp=BASE+"__equirect_tmp.mp4"   # NOT "*reframe*" — avoid confusion with the real output
     run(["ffmpeg","-y","-v","error","-an","-ss",str(T0),"-i",A.src,"-t",str(DUR),
-         "-filter_complex",f"[0:0][0:4]vstack,v360=eac:e:w={EQW}:h={EQH}","-r",str(FPS),BASE+"_eq.mp4"])
-    run(["ffmpeg","-y","-v","error","-i",BASE+"_eq.mp4","eqf/%04d.png"])
+         "-filter_complex",f"[0:0][0:4]vstack,v360=eac:e:w={EQW}:h={EQH}","-r",str(FPS),eqtmp])
+    run(["ffmpeg","-y","-v","error","-i",eqtmp,"eqf/%04d.png"])
+    os.remove(eqtmp)                  # redundant once eqf/ is dumped
 frames=sorted(os.listdir("eqf"))[:nfr]; nfr=len(frames)
 shutil.rmtree("of",ignore_errors=True); os.makedirs("of"); procs=[]
 for i,fn in enumerate(frames):
