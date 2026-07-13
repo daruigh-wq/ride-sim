@@ -149,11 +149,31 @@ in `research/`, reuse `eqf/`). `turn_register.py` = earlier csv-bearing version,
 Crop + per-face rotate the two tracks into ffmpeg's standard EAC face order; validate against
 `track0_frame.png` / `track4_frame.png`. Forward-only riding view barely needs it.
 
-### Step 3 — Productionize the reframe
-- Offline pre-render: one script `reframe.py IN.360 route.tcx → OUT.mp4` (extract gpmd → CORI →
-  high-pass/sim yaw → frame-by-frame v360 → encode). Decide default FOV (~130–150°) and output res.
-- Later: live in-app GLSL shader for the true "drop `.360` → ride" experience (app bundles ffmpeg
-  for the offline path first).
+### Step 3 — Productionize the reframe  ✅ v1 BUILT 2026-07-13 (`research/reframe.py`)
+`reframe.py IN.360 [OUT.mp4]` — extracts gpmd from the `.360`, decodes **GPS9 route + CORI + GRAV**,
+renders a road-following pinhole clip + `OUT.route.npz` sidecar. `--validate` burns the ride_sim
+overlay for QC. **KEY DESIGN — LOCAL fusion only** (CORI & GPS are each reliable only *locally*;
+a global absolute-frame fit is fragile — CORI heading drifts vs GPS, they diverged −169° vs −43°
+cumulative over this clip even though they agree in any ~10 s window, and GPS course-over-ground
+goes garbage at the 9% stopped samples):
+- **Video = pure CORI road-follow**: `applied = cori_head − lp(cori_head, τ)` — a local high-pass,
+  bounded everywhere regardless of drift. No GPS in the video yaw (injecting the drifted GPS frame
+  made `applied` blow up to ±260°). GRAV de-roll, pitch 0, FOV 130.
+- **Overlay/route = GPS positions + local distance-based bearing**, shifted by the reframe's own
+  correction: `overlay_head = gps_bearing(rider) + applied` (`--sgn/--yaw-off` for the small constant
+  camera-vs-travel mount offset). Everything local → no global-fit fragility.
+- **CORI continuous heading**: integrate *incremental* inter-sample yaw + cumsum (the clip-start
+  rotation-vector folds past ±180° over a long ride — can't be used directly).
+- Validated on the 40–50 s turn (`reframe_validate*.png`): horizon level, road followed, near
+  centerline on the road; through the intersection the centerline traces the rider's actual GPS
+  left-turn (the street continuing ahead-right is the one they don't take). Far dashes streak to the
+  horizon past a sharp corner — inherent (ride_sim's `DASH_FAR_M=50` does the same).
+- **Provenance of `GS010004_yaw_gps.csv`** (settled): correlates only +0.47 (rate) with the `.360`'s
+  own GPS9 course, ~3.6° detrended diff → NOT a GPS9 copy; likely a Garmin/magnetometer-blend from an
+  earlier session. Moot — reframe.py uses the camera's own GPS9.
+- **TODO to graduate**: move `reframe.py` into the repo (currently `research/`, gitignored),
+  de-hardcode the `gpmf_inventory` path, wire the `.route.npz` into ride_sim, set `video_fov_h_deg=130`.
+  Later: live in-app GLSL shader for the true "drop `.360` → ride" path.
 
 ### Step 4 — Re-test overlay registration
 With an owned pinhole + sim-yaw video, the existing `_project` / `_draw_cube` / `_draw_tangent_line`
