@@ -108,6 +108,30 @@ Built `build_road_follow.py` (road-follower) alongside the world-lock `build_sta
   source wired in (see Step 4). Also: a one-time absolute-heading alignment (CORI is relative to
   clip start; see Open questions / MNOR).
 
+### Step 1.5 — Sim-bearing yaw + overlay registration  ✅ DONE 2026-07-13
+Validated that our owned reframe co-registers with ride_sim's overlay (`overlay_register.py`
+straight-window projection cal; `cori_register.py` the good CORI-consistent turn test; both
+in `research/`, reuse `eqf/`). `turn_register.py` = earlier csv-bearing version, superseded.
+- **Projection: EXACT.** Owned true-rectilinear reframe (`v360 eac→e→flat`) at **FOV=130** matches
+  `_project()` when `video_fov_h_deg` is set to the reframe FOV. On a straight window (t≈99–107 s)
+  the overlay cube + depth-ruler + centerline land on the road and the horizon sits at `v=H/2`.
+  **This retires the POLY-projection mismatch that killed the old effort** (`reg_F130_P0_H1.0.png`).
+- **Pitch = 0 (horizontal axis).** GRAV `gz≈0` → camera is level in pitch; the cosmetic −12°
+  from `build_stab_fbf` BREAKS the overlay (horizon must be at center). Use pitch 0.
+- **Roll: GRAV de-roll** `roll = −atan2(gx, gy)` (GRAV **+Y = DOWN**, gy≈+1 level). ~±3° on
+  straights, −15° at the turn apex; levels the horizon through the lean (verified `roll_m1`).
+- **Yaw: drive from CORI, not the csv.** `applied = rv_y − lp(rv_y)` (road-follow); drive BOTH
+  the reframe yaw and the overlay route from the SAME CORI heading so they're timed-consistent.
+  The committed `GS010004_yaw_gps.csv` (likely magnetometer) has a timing/source mismatch that
+  swings the centerline — do NOT use it for this.
+- **Centerline through the sharp turn: app-data-gated.** Exact on straights; approximate through
+  the corner because GS0004 has **NO GPS** (no true positions/speed) — the route is reconstructed
+  from heading integrated at a guessed speed V (≈6–8 m/s here), which can't reproduce a corner
+  where speed varies and the rider cuts the line. **In the app the loaded TCX gives true positions
+  → the centerline registers by construction.** (V-tuning also estimates ride speed as a bonus.)
+- **⚠ APP ACTION when productionizing:** set `ride_sim.py:829 video_fov_h_deg` from `118.8`
+  (POLY-calibrated to the old GoPro export) to the owned-reframe FOV (130), else it misregisters.
+
 ### Step 2 — Fix de-EAC seams (polish, low priority)
 Crop + per-face rotate the two tracks into ffmpeg's standard EAC face order; validate against
 `track0_frame.png` / `track4_frame.png`. Forward-only riding view barely needs it.
