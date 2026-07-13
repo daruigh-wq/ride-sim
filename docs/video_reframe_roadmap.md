@@ -89,17 +89,24 @@ Related memory (auto-loaded next session): `project_video_reframe_pipeline`,
 
 ## Next steps (ordered)
 
-### Step 1 — High-pass / sim-driven reframe  ← START HERE
-Turn `build_stab_fbf.py` from world-lock into a road-follower:
-- **Yaw:** counter only the *fast* deviation. `yaw_counter(t) = -(yaw_cori(t) − smooth(yaw_cori(t)))`
-  where `smooth` is a low-pass (~0.5–1 s window). Keeps the slow heading (follows the road), removes
-  weave/buzz. Later: replace `smooth(yaw_cori)` with the **sim route bearing** so the view heading ==
-  the overlay heading by construction (registration for free).
-- **Roll:** force `roll = 0` (kill lean — biggest nausea/wrongness source).
-- **Pitch:** keep a gentle smoothed pitch (grade), or fixed `PITCH0`.
-- **Validate:** render a ride window with both weave and a curve; confirm it *follows the road*,
-  horizon level, wobble gone. Re-use the phase-corr wobble metric (should drop vs static while the
-  slow heading still tracks).
+### Step 1 — High-pass / sim-driven reframe  ✅ DONE 2026-07-13 (`build_road_follow.py`)
+Built `build_road_follow.py` (road-follower) alongside the world-lock `build_stab_fbf.py`.
+- **Yaw high-pass:** `yaw = +(rv_y − lp(rv_y))`, `lp` = centered moving average (LP_S≈0.7 s,
+  reflect-padded). Counter only the fast residual → slow heading is left uncountered so the view
+  follows the road. (Sign is `+`, consistent with the validated world-lock `counter = +rv`.)
+- **Roll:** forced `roll = 0`.
+- **Pitch:** `PITCH0 + lp(rv_x)` (keep slow grade, drop bounce).
+- **VALIDATED on the 40–50 s 75° turn (GS0004)** — the exact window where world-lock failed:
+  heading rv_y swings 0→75.7°, slow heading tracks it, `yaw_road` residual only −2.4..+1.7°
+  (pure wobble). `montage_road.png` (rows static / world-lock / road-follow): road-follow keeps
+  the road framed through the whole turn; world-lock swings to the fence/hand/parked-SUV by t≈7.5 s.
+  Phase-corr high-freq wobble: static 0.70 px, **road-follow 0.56 px (−20%)**, world 0.31 (degenerate,
+  wrong content). Renders `rf_stat.mp4` / `rf_world.mp4` / `rf_road.mp4` + `montage_road.png`.
+  `REUSE_EQF=1` skips re-extraction for fast LP_S iteration.
+- **Still TODO (the real payoff):** replace `lp(rv_y)` with the **sim route bearing** so the view
+  heading == the overlay heading by construction → free registration. Needs the GPS/route-bearing
+  source wired in (see Step 4). Also: a one-time absolute-heading alignment (CORI is relative to
+  clip start; see Open questions / MNOR).
 
 ### Step 2 — Fix de-EAC seams (polish, low priority)
 Crop + per-face rotate the two tracks into ffmpeg's standard EAC face order; validate against
@@ -138,6 +145,7 @@ confirm the old registration failures are gone.
 cd research/motor-imu-rnd            # (gitignored; scripts live here)
 F=/Volumes/Untitled/DCIM/100GOPRO/GS010004.360
 ffmpeg -y -an -i "$F" -map 0:3 -c copy -f data gpmd_0004.bin      # telemetry
-python build_stab_fbf.py gpmd_0004.bin "$F" 179.88 40 10 -12 130  # stabilize 40–50s window
-# -> fbf_stab.mp4 (world-lock) + fbf_stat.mp4 (raw pinhole). Step 1 makes stab a road-follower.
+python build_stab_fbf.py    gpmd_0004.bin "$F" 179.88 40 10 -12 130      # world-lock (Step 0)
+python build_road_follow.py gpmd_0004.bin "$F" 179.88 40 10 -12 130 0.7  # ROAD-FOLLOW (Step 1) ✅
+# road_follow -> rf_road.mp4 (+ rf_stat/rf_world) + montage_road.png. REUSE_EQF=1 to skip re-extract.
 ```
