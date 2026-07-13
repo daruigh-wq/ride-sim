@@ -177,9 +177,20 @@ fusion is still the clean choice (drift-immune, no global unwrap to get right):
 - **Provenance of `GS010004_yaw_gps.csv`** (settled): correlates only +0.47 (rate) with the `.360`'s
   own GPS9 course, ~3.6° detrended diff → NOT a GPS9 copy; likely a Garmin/magnetometer-blend from an
   earlier session. Moot — reframe.py uses the camera's own GPS9.
-- **TODO to graduate**: move `reframe.py` into the repo (currently `research/`, gitignored),
-  de-hardcode the `gpmf_inventory` path, wire the `.route.npz` into ride_sim, set `video_fov_h_deg=130`.
-  Later: live in-app GLSL shader for the true "drop `.360` → ride" path.
+### Step 3.5 — Graduate reframe.py into the app  ✅ DONE 2026-07-13 (`tools/reframe.py`, committed)
+`reframe.py` now lives in the repo (`tools/`, public), self-contained, `gpmf_inventory` path
+`__file__`-relative. **Zero ride_sim code changes needed:** it emits a **TCX** from the `.360`'s own
+GPS9 (lat/lon/alt/dist), which loads through the existing `load_tcx_route` (verified: 99 pts round-trip).
+- Added **GPS speed-gating** (`--speed-gate`, default 1.5 m/s): course-over-ground is dropped when
+  stationary and held from moving samples, so the start ramp / final stop don't corrupt the route.
+- **Use in app:** `python tools/reframe.py IN.360 OUT.mp4 [--t0 S --dur S]` → `OUT.mp4` + `OUT.tcx`
+  (+ `OUT.route.npz` advanced sidecar). In ride_sim: video = `OUT.mp4`, route = `OUT.tcx`, **offset 0,
+  FOV = 130, camera height 1.0 m** (the tool prints this line). FOV is the persisted runtime setting
+  (Settings, `ride_sim.py:2791`) — left the 118.8 default alone so existing GoPro-Player exports still
+  register; set 130 per reframed video.
+- **Known limits / future:** frame-by-frame PNG intermediates are disk-heavy on a full ride (~3 MB ×
+  30 fps); a future pass should pipe frames instead. A deeper integration ("Import .360…" menu that
+  calls reframe.py, auto-sets FOV) and the live GLSL shader path remain. `--validate` burns the overlay.
 
 ### Step 4 — Re-test overlay registration
 With an owned pinhole + sim-yaw video, the existing `_project` / `_draw_cube` / `_draw_tangent_line`
