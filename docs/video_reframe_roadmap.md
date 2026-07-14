@@ -202,6 +202,36 @@ GPS9 (lat/lon/alt/dist), which loads through the existing `load_tcx_route` (veri
   30 fps → ~24 GB); a future pass should pipe frames instead. A deeper integration ("Import .360…" menu
   that calls reframe.py, auto-sets FOV) and the live GLSL shader path remain. `--validate` burns the overlay.
 
+### Step 3.6 — Stabilization rework (jitter fix)  ⏳ IN PROGRESS — RESUME HERE (2026-07-13)
+**Problem:** the reframe has bad high-freq roll/pitch JITTER (~10× GoPro). **Root cause:** the 30 Hz GRAV
+vector is GoPro's *smoothed/lagged* gravity — inadequate for per-frame horizon leveling (subtracting a
+lagged gravity leaves the fast motion AND adds counter-motion = jitter). Confirmed by user: the RAW `.360`
+is **unstabilized** (baked-in camera tilt + vibration); the GoPro app's horizon-lock + re-level is perfect
+because it integrates the **789 Hz gyro fused with accel**. Our earlier (April) equirect exports looked
+fine only because the GoPro app had stabilization applied (it remembers settings). *(Also fixed along the
+way: the v_fov 1.63× stretch, and the GRAV sampling-step → use `np.interp` at frame times.)*
+
+**Solution (research-backed — replicate Gyroflow's core, don't use Gyroflow directly):** Gyroflow can't
+reframe a `.360` (flat-footage stabilizer only; it *will* read the `.360`'s gyro but needs a separately-
+supplied unstabilized flat crop to stabilize). So do the leveling at OUR reframe stage:
+- Use the **MIT-licensed `vqf` pip package** (the exact fusion algo Gyroflow defaults to) → feed 789 Hz
+  GYRO (÷939 rad/s) + ~197 Hz ACCL (÷417 m/s²) → accurate gravity-referenced orientation quaternions.
+  **No GPL entanglement** (VQF is MIT; write our own leveling/smoothing, don't lift Gyroflow's GPLv3 Rust).
+- Per frame: sample the fused quat → body-frame gravity → **roll (level horizon)** + **smooth pitch**
+  (EMA two-pass low-pass); **keep the existing road-follow yaw**. Feed to the per-frame `v360=e:flat`
+  yaw/pitch/roll machinery we already have. Export the per-frame quat for overlay registration.
+- ~1–2 days. Prototype first on the 1:20 window (t=74–86) and compare to `jit_A_current.mp4`.
+- **Gyroflow-assisted alternative (validation only):** feed Gyroflow our de-EAC flat reframe + the gyro
+  → it stabilizes. Needs GoPro Player (or our export) for the unstabilized flat crop (user hunting the
+  unlabeled GoPro-Player button that exports an *unstabilized* reframe; used it in April).
+
+**Resume recipe (VQF path):** `pip install vqf`; read GYRO+ACCL w/ timestamps from `demo/GS0004_reframe_gpmd.bin`;
+resample accel→gyro rate; `offlineVQF` → quats @789 Hz; sample @30 fps → body gravity → roll=`atan2(gx,gy)`,
+pitch=`atan2(gz,gy)` (VERIFY vs GRAV + signs — the axis mapping was never confirmable on this horizon-less
+footage, so validate by eye on the render); apply interpolated + smoothed pitch; render t=74–86 → compare.
+**Source refs (READ, don't copy — GPLv3):** gyroflow `src/core/{imu_integration/vqf.rs, smoothing/default_algo.rs,
+smoothing/horizon.rs, gyro_source/mod.rs}`; `smoothed_quat_at_timestamp()` = the per-frame stabilized orientation.
+
 ### Step 4 — Re-test overlay registration
 With an owned pinhole + sim-yaw video, the existing `_project` / `_draw_cube` / `_draw_tangent_line`
 should road-lock (same projection, same heading). Re-run the "R" road path over the new reframe and
