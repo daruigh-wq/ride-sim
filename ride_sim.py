@@ -173,6 +173,17 @@ CRUISE_STEP_PCT      = 0.03
 CRUISE_STEP_AGGR_PCT = 0.10   # used when |err| > CRUISE_AGGRESSIVE_ERR_SEC
 CRUISE_AGGRESSIVE_ERR_SEC = 8.0
 
+# Feedforward: the recorded video was shot at some pace; a rider going much
+# slower (or faster) than that needs a playback rate well away from 1.0 to hold
+# sync. Cruise nudges only ±3–10% around its base rate, so it structurally
+# cannot hold, say, 0.74× — it drifts until a 15 s hard-seek fires, then repeats
+# (the "backward-seek limit cycle" on a deliberately-slow ride). Fix: set the
+# base rate to live_speed / recorded_speed_at_position so cruise only corrects
+# residual drift. FF_WINDOW_M is the ± distance window for the recorded-speed
+# secant — wide enough to reject trackpoint noise, short enough to track climbs.
+FF_WINDOW_M          = 25.0
+FF_MIN_REC_SPD_MPS   = 1e-3   # guard div-by-zero on recorded near-stops
+
 # SYNC_DEBUG: when set in the environment, the ride loop writes a per-tick
 # CSV of sync state to ~/ride_sim_sync_debug_<ts>.csv. Use it to diagnose
 # why playback rate or seeks drift over time. Off by default; no cost when
@@ -530,6 +541,22 @@ def compute_grade_pct(dist_m, elev_m, x_m: float, lookahead: float) -> float:
     dx = dist_m[j] - dist_m[i]
     return 0.0 if dx < 1e-6 else 100.0 * (elev_m[j] - elev_m[i]) / dx
 
+def recorded_speed_at(dist_m, time_s, x_m: float, window_m: float = FF_WINDOW_M):
+    """Local recorded speed (m/s) at route distance x_m, from a centered
+    distance-window secant over the route's dist/time arrays. This is the pace
+    the video was shot at here; feedforward divides live speed by it to get the
+    playback rate that holds sync. Returns None when undefined (degenerate
+    window or non-advancing time)."""
+    i0 = find_index_for_distance(dist_m, x_m - window_m)
+    i1 = find_index_for_distance(dist_m, x_m + window_m)
+    if i1 <= i0:
+        return None
+    dd = dist_m[i1] - dist_m[i0]
+    dt = time_s[i1] - time_s[i0]
+    if dt <= 1e-6:
+        return None
+    return dd / dt
+
 
 # ─────────────────────────────────────────────────────────────
 #  Activity recorder (TCX export)
@@ -752,6 +779,13 @@ class SharedState:
         self.power_w              = 0.0
         self.hr_bpm               = 0.0
         self.grade_pct            = 0.0
+        # Running ride totals (worker-accumulated, moving-only — exclude pauses)
+        self.avg_speed_mps        = 0.0    # moving distance / moving time
+        self.total_ascent_m       = 0.0    # ∫ positive grade over distance ridden
+        self.energy_kj            = 0.0    # ∫ power dt
+        # Rider body weight for W/kg (RIDER_MASS_KG includes the ~10 kg bike, so
+        # W/kg needs a separate body-only figure). Persisted; settable in Settings.
+        self.body_weight_kg       = 73.0
 
         # ── Sync state (worker → GUI) ──
         self.video_t              = 0.0
@@ -799,6 +833,10 @@ class SharedState:
             {"key": "GRADE",    "visible": True,  "size": 1},
             {"key": "DISTANCE", "visible": True,  "size": 1},
             {"key": "ELAPSED",  "visible": True,  "size": 1},
+            {"key": "AVGSPEED", "visible": False, "size": 1},
+            {"key": "WKG",      "visible": False, "size": 1},
+            {"key": "ASCENT",   "visible": False, "size": 1},
+            {"key": "ENERGY",   "visible": False, "size": 1},
             {"key": "SYNC",     "visible": False, "size": 0},
         ]
         # Map overlay: corner 0=TR 1=TL 2=BR 3=BL, size_pct=% of video height
@@ -806,6 +844,9 @@ class SharedState:
         self.map_size_pct = 28
         # Pill layout: 0 = bottom row (default), 1 = stacked right, 2 = stacked left
         self.pill_layout  = 0
+        # Elevation/grade strip along the bottom (terrain silhouette, grade-tinted),
+        # x-axis = distance (matches the progress bar). Off by default. Hotkey "E".
+        self.grade_strip_visible = False
 
         # ── Pacer cube overlay (cube-overlay branch) ──
         # Wireframe cube drawn on the optical axis at depth = pacer_gap_m metres.
@@ -852,6 +893,7 @@ class SharedState:
         self.route_lat_arr     = None    # numpy float array, NaN where missing
         self.route_lon_arr     = None    # numpy float array, NaN where missing
         self.route_dist_arr    = None    # numpy float array, cumulative metres
+        self.route_elev_arr    = None    # numpy float array, metres — grade strip
 
 
 # ─────────────────────────────────────────────────────────────
@@ -889,6 +931,11 @@ async def run_ride_loop(
     last_grade_send  = 0.0
     last_grade_value = None
     smoothed_grade   = None
+    # Running ride totals (moving-only; accumulated once per moving tick below)
+    moving_time_s    = 0.0
+    moving_dist_m    = 0.0
+    energy_j         = 0.0
+    ascent_m         = 0.0
     # Pause state: True iff video is currently paused (auto for low speed OR
     # user-pause via Space). pause_started_t_sim records when the pause began,
     # so on resume we can roll ghost_t_offset_s forward by the pause duration
@@ -1151,6 +1198,21 @@ async def run_ride_loop(
                 state.position_bump_m = 0.0
         virtual_dist = clamp(virtual_dist + smoothed * dt_real + bump, 0.0, total_dist)
 
+        # ── Running ride totals (this branch runs only while moving — pause and
+        # seek both `continue` above — so these are naturally moving-only) ──
+        d_dist = smoothed * dt_real                      # forward distance this tick
+        if d_dist > 0.0:
+            moving_time_s += dt_real
+            moving_dist_m += d_dist
+            if grade > 0.0:                              # ∫ positive grade = ascent
+                ascent_m += (grade / 100.0) * d_dist
+        energy_j += max(0.0, tel.get("power_w", 0.0)) * dt_real
+        with state.lock:
+            state.total_ascent_m = ascent_m
+            state.energy_kj      = energy_j / 1000.0
+            state.avg_speed_mps  = (moving_dist_m / moving_time_s
+                                    if moving_time_s > 0.0 else 0.0)
+
         target_route_t = interp_time_from_distance(dist_m, time_s, virtual_dist)
         with state.lock:
             offset = state.video_offset_sec + state.video_offset_adj
@@ -1169,6 +1231,18 @@ async def run_ride_loop(
 
         err = target_video_t - video_t
 
+        # Feedforward: scale the user's base rate by how the rider's live pace
+        # compares to the pace the video was shot at *here*. On a matched-pace
+        # ride rec_spd ≈ smoothed so eff_base ≈ base (no change). On a
+        # deliberately-slow ride eff_base drops to ~0.74× directly, so cruise
+        # sits in its deadband at the right rate instead of drifting into
+        # periodic backward hard-seeks. The base_rate slider stays a fine trim
+        # multiplier (default 1.0). Final clamps below bound the result.
+        rec_spd = recorded_speed_at(dist_m, time_s, virtual_dist)
+        eff_base = base
+        if rec_spd is not None and rec_spd > FF_MIN_REC_SPD_MPS:
+            eff_base = base * (smoothed / rec_spd)
+
         if video_lock:
             # World/map mode: position already drives the map and the UDP world
             # directly (virtual_dist integration above). Don't run the video-rate
@@ -1185,15 +1259,15 @@ async def run_ride_loop(
             # 3% step) could never recover from a video-ahead drift. Negative
             # err now seeks the video backward to target_video_t.
             signals.request_seek.emit(target_video_t)
-            signals.request_rate.emit(base)
+            signals.request_rate.emit(eff_base)
             last_seek = now
             _dbg_act  = "seek-back" if err < 0 else "seek-fwd"
-            _dbg_rate = base
+            _dbg_rate = eff_base
         else:
             if abs(err) < deadband:
-                new_rate = clamp(base, min_r, max_r)
+                new_rate = clamp(eff_base, min_r, max_r)
             elif strategy == "proportional":
-                new_rate = clamp(base + kp * err, min_r, max_r)
+                new_rate = clamp(eff_base + kp * err, min_r, max_r)
             else:
                 # Adaptive cruise step: when |err| is large, take bigger
                 # rate jumps so cruise converges fast enough to avoid the
@@ -1204,7 +1278,7 @@ async def run_ride_loop(
                             if abs(err) > CRUISE_AGGRESSIVE_ERR_SEC
                             else CRUISE_STEP_PCT)
                 new_rate = clamp(
-                    base * (1.0 + step if err > 0 else 1.0 - step), min_r, max_r)
+                    eff_base * (1.0 + step if err > 0 else 1.0 - step), min_r, max_r)
             signals.request_rate.emit(new_rate)
             _dbg_act  = "rate"
             _dbg_rate = new_rate
@@ -1515,6 +1589,19 @@ class OverlayWidget(QtWidgets.QWidget):
             return "HR", f"{snap['hr']:.0f}", "bpm"
         if k == "GRADE":
             return "GRADE", f"{snap['grade']:+.1f}", "%"
+        if k == "AVGSPEED":
+            v = snap["avg_speed"] * (2.23694 if imp else 3.6)
+            return "AVG SPD", f"{v:.1f}", "mph" if imp else "km/h"
+        if k == "WKG":
+            bw = snap["body_weight"]
+            wkg = (snap["power"] / bw) if bw > 0 else 0.0
+            return "W/KG", f"{wkg:.1f}", "W/kg"
+        if k == "ASCENT":
+            if imp:
+                return "ASCENT", f"{snap['ascent'] * 3.28084:.0f}", "ft"
+            return "ASCENT", f"{snap['ascent']:.0f}", "m"
+        if k == "ENERGY":
+            return "ENERGY", f"{snap['energy_kj']:.0f}", "kJ"
         if k == "DISTANCE":
             pct = (snap["dist"] / snap["total"] * 100) if snap["total"] > 0 else 0
             if imp:
@@ -1554,6 +1641,10 @@ class OverlayWidget(QtWidgets.QWidget):
                 "power":    self.state.power_w,
                 "hr":       self.state.hr_bpm,
                 "grade":    self.state.grade_pct,
+                "avg_speed":  self.state.avg_speed_mps,
+                "ascent":     self.state.total_ascent_m,
+                "energy_kj":  self.state.energy_kj,
+                "body_weight": self.state.body_weight_kg,
                 "dist":     self.state.virtual_dist_m,
                 "total":    self.state.total_dist_m,
                 "err":      self.state.err_s,
@@ -1584,6 +1675,8 @@ class OverlayWidget(QtWidgets.QWidget):
                 "route_lat":       self.state.route_lat_arr,
                 "route_lon":       self.state.route_lon_arr,
                 "route_dist":      self.state.route_dist_arr,
+                "route_elev":      self.state.route_elev_arr,
+                "grade_strip":     self.state.grade_strip_visible,
                 "fov_h_deg":       self.state.video_fov_h_deg,
                 "tune_msg":        self.state._tune_message,
                 "tune_t":          self.state._tune_message_t,
@@ -1624,6 +1717,13 @@ class OverlayWidget(QtWidgets.QWidget):
         pills_cfg = [c for c in snap["pill_cfg"] if c["visible"]]
         layout    = snap["pill_layout"]   # 0=bottom row, 1=stacked right, 2=stacked left
 
+        # ── Elevation/grade strip (bottom band) ──
+        # Reserve its height first so the pills + progress bar float above it.
+        strip_h = 0
+        if (snap["grade_strip"] and snap["route_elev"] is not None
+                and snap["route_dist"] is not None and snap["total"] > 0):
+            strip_h = self._grade_strip_h(h)
+
         # ── Pill positions ──
         # Compute (px, py, sz) for each visible pill based on layout mode.
         positions = []
@@ -1632,7 +1732,7 @@ class OverlayWidget(QtWidgets.QWidget):
                 total_pw = sum(self.PILL_SIZES[c["size"]]["w"] for c in pills_cfg)
                 total_pw += self.GAP * (len(pills_cfg) - 1)
                 x = (w - total_pw) // 2
-                base_y = h - self.MARGIN
+                base_y = h - self.MARGIN - strip_h
                 for cfg in pills_cfg:
                     sz = self.PILL_SIZES[cfg["size"]]
                     positions.append((cfg, x, base_y - sz["h"], sz))
@@ -1652,15 +1752,20 @@ class OverlayWidget(QtWidgets.QWidget):
                     positions.append((cfg, px, y, sz))
                     y += sz["h"] + self.GAP
 
+        # ── Elevation/grade strip ──
+        # Drawn before the progress bar so the accent fill reads on top of it.
+        if strip_h > 0:
+            self._draw_grade_strip(p, w, h, strip_h, snap)
+
         # ── Progress bar ──
         if snap["total"] > 0:
             pct   = snap["dist"] / snap["total"]
             bar_h = 4
             if layout == 0 and pills_cfg:
                 max_ph = max(self.PILL_SIZES[c["size"]]["h"] for c in pills_cfg)
-                bar_y  = h - max_ph - self.MARGIN - bar_h - 2
+                bar_y  = h - max_ph - self.MARGIN - bar_h - 2 - strip_h
             else:
-                bar_y  = h - self.MARGIN - bar_h
+                bar_y  = h - self.MARGIN - bar_h - strip_h
             p.setPen(Qt.NoPen)
             p.setBrush(QtGui.QBrush(QtGui.QColor(40, 40, 60)))
             p.drawRect(0, bar_y, w, bar_h)
@@ -1733,6 +1838,105 @@ class OverlayWidget(QtWidgets.QWidget):
         self._draw_tune_msg(p, w, h, snap)
 
         p.end()
+
+    def _grade_strip_h(self, h):
+        """Height of the bottom elevation/grade band in px."""
+        return int(clamp(h * 0.11, 46, 96))
+
+    # Colour ramp for the grade strip: (grade %, (r, g, b)). Interpolated
+    # continuously so neighbouring columns fade rather than step-band — keeps
+    # a long, noisy route from looking like a barcode.
+    _GRADE_STOPS = (
+        (-8.0, ( 45, 150, 235)),   # steep descent — blue
+        (-2.0, ( 95, 200, 205)),   # gentle descent — teal
+        ( 0.0, ( 95, 200, 110)),   # flat — green
+        ( 2.0, (155, 205,  85)),
+        ( 4.0, (220, 205,  70)),   # yellow
+        ( 6.0, (240, 150,  45)),   # orange
+        ( 9.0, (238,  95,  45)),
+        (12.0, (235,  60,  50)),   # steep climb — red
+    )
+
+    @classmethod
+    def _grade_color(cls, g):
+        """Continuous terrain-strip colour for a local grade g (percent)."""
+        stops = cls._GRADE_STOPS
+        if g <= stops[0][0]:
+            r, gg, b = stops[0][1]
+        elif g >= stops[-1][0]:
+            r, gg, b = stops[-1][1]
+        else:
+            r = gg = b = 0
+            for (g0, c0), (g1, c1) in zip(stops, stops[1:]):
+                if g0 <= g <= g1:
+                    t  = (g - g0) / (g1 - g0)
+                    r  = c0[0] + t * (c1[0] - c0[0])
+                    gg = c0[1] + t * (c1[1] - c0[1])
+                    b  = c0[2] + t * (c1[2] - c0[2])
+                    break
+        return QtGui.QColor(int(r), int(gg), int(b))
+
+    def _draw_grade_strip(self, p, w, h, strip_h, snap):
+        """Elevation silhouette along the bottom, tinted by local grade.
+        x-axis = route distance (same normalisation as the progress bar), so the
+        distance progress fill above it doubles as the position marker."""
+        import numpy as _np
+        dist  = snap["route_dist"]
+        elev  = snap["route_elev"]
+        total = snap["total"]
+        n = 0 if elev is None else len(elev)
+        if n < 2 or w <= 0 or total <= 0:
+            return
+        top = h - strip_h                      # band occupies [top, h]
+
+        # Translucent backing so the silhouette reads over bright video.
+        p.setPen(Qt.NoPen)
+        p.setBrush(QtGui.QBrush(QtGui.QColor(0, 0, 0, 120)))
+        p.drawRect(0, top, w, strip_h)
+
+        # Rebuild the silhouette columns only when geometry / route changes;
+        # paintEvent runs ~10 Hz and the profile is static per route.
+        key = (w, strip_h, id(elev), n)
+        if getattr(self, "_grade_cache_key", None) != key:
+            emin = float(_np.nanmin(elev)); emax = float(_np.nanmax(elev))
+            erange = max(emax - emin, 8.0)     # floor so flat routes aren't a spike
+            usable = strip_h - 9               # headroom under the top edge
+            step   = 2                          # column width, px
+            # ± window for the local grade colour. Scale it with how much route
+            # each column represents so a long route (hundreds of m/column) is
+            # averaged over its own span instead of point-sampled into a barcode.
+            # Short routes keep the ~30 m floor and stay crisp.
+            gwin   = max(30.0, (total / w) * step * 1.5)
+            xs   = list(range(0, w, step))
+            dcol = _np.array([(x / w) * total for x in xs])
+            ecol = _np.interp(dcol, dist, elev)
+            tops = top + 3 + (1.0 - (ecol - emin) / erange) * usable
+            d0   = _np.clip(dcol - gwin, 0.0, total)
+            d1   = _np.clip(dcol + gwin, 0.0, total)
+            span = _np.maximum(d1 - d0, 1e-6)
+            grades = 100.0 * (_np.interp(d1, dist, elev) -
+                              _np.interp(d0, dist, elev)) / span
+            # Smooth the per-column grade so the colour resolves into clean
+            # climb/descent zones instead of speckle (a mountain stage genuinely
+            # flips grade ~50×; raw colouring reads busy). Window is in columns
+            # (~1.3% of the strip width), so it's consistent on screen and scales
+            # with resolution rather than route length — short clips stay crisp.
+            kw = 25
+            if len(grades) >= kw:
+                grades = _np.convolve(grades, _np.ones(kw) / kw, mode="same")
+            cols = [(int(x), float(t), self._grade_color(float(g)))
+                    for x, t, g in zip(xs, tops, grades)]
+            self._grade_cache_key = key
+            self._grade_cols = cols
+            self._grade_step = step
+
+        step = self._grade_step
+        for x, col_top, color in self._grade_cols:
+            p.setBrush(QtGui.QBrush(color))
+            p.drawRect(x, int(col_top), step, int(h - col_top))
+
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 45), 1))
+        p.drawLine(0, top, w, top)
 
     def _draw_ghost_bar(self, p, w, h, snap):
         gap_m = snap["ghost_gap_m"]
@@ -2290,6 +2494,8 @@ class SettingsDialog(QtWidgets.QDialog):
             mxr_i       = int(state.max_rate * 100)
             strategy    = state.strategy
             lookahead_m = int(state.grade_lookahead_m)
+            grade_strip = state.grade_strip_visible
+            body_weight = state.body_weight_kg
 
         tabs = QtWidgets.QTabWidget()
         lay  = QtWidgets.QVBoxLayout(self)
@@ -2312,6 +2518,30 @@ class SettingsDialog(QtWidgets.QDialog):
         layout_row.addWidget(self._pill_layout_combo)
         layout_row.addStretch()
         hud_lay.addLayout(layout_row)
+
+        self._grade_strip_cb = QtWidgets.QCheckBox(
+            "Show elevation / grade strip along the bottom  (hotkey: E)")
+        self._grade_strip_cb.setToolTip(
+            "A terrain silhouette across the bottom of the video, coloured by "
+            "gradient (green flat → orange/red climbs → blue descents). Its "
+            "x-axis is route distance, so it lines up with the progress bar.")
+        self._grade_strip_cb.setChecked(grade_strip)
+        hud_lay.addWidget(self._grade_strip_cb)
+
+        bw_row = QtWidgets.QHBoxLayout()
+        bw_row.addWidget(QtWidgets.QLabel("Body weight (for W/kg pill):"))
+        self._body_weight_spin = QtWidgets.QDoubleSpinBox()
+        self._body_weight_spin.setRange(30.0, 200.0)
+        self._body_weight_spin.setDecimals(1)
+        self._body_weight_spin.setSingleStep(0.5)
+        self._body_weight_spin.setSuffix(" kg")
+        self._body_weight_spin.setValue(body_weight)
+        self._body_weight_spin.setToolTip(
+            "Rider body weight only (not the bike). W/kg = live power ÷ this. "
+            "The physics mass (rider + bike) is set separately in the code.")
+        bw_row.addWidget(self._body_weight_spin)
+        bw_row.addStretch()
+        hud_lay.addLayout(bw_row)
 
         self._pill_list = QtWidgets.QListWidget()
         self._pill_list.setDragDropMode(QtWidgets.QListWidget.InternalMove)
@@ -2464,6 +2694,8 @@ class SettingsDialog(QtWidgets.QDialog):
         with self.state.lock:
             self.state.hud_pill_cfg  = new_cfg
             self.state.pill_layout   = self._pill_layout_combo.currentIndex()
+            self.state.grade_strip_visible = self._grade_strip_cb.isChecked()
+            self.state.body_weight_kg = self._body_weight_spin.value()
             self.state.map_corner    = self._corner_combo.currentIndex()
             self.state.map_size_pct  = self._map_size_s.value()
             self.state.map_opacity   = self._opa_s.value() / 100.0
@@ -2512,6 +2744,11 @@ class ControlsPanel(QtWidgets.QWidget):
         pace_lbl.setFixedWidth(120)
         self.base_s = QtWidgets.QSlider(Qt.Horizontal)
         self.base_s.setRange(50, 200); self.base_s.setValue(100)
+        self.base_s.setToolTip(
+            "Fine trim on playback pace. The sync now auto-matches the video to "
+            "your live speed vs. the pace it was shot at (feedforward), so 1.00× "
+            "tracks you automatically even when you ride much slower or faster "
+            "than the recording. Nudge this only to bias the overall pace.")
         self.base_v = QtWidgets.QLabel("1.00×")
         self.base_v.setFixedWidth(55)
         self.base_v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -2766,6 +3003,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._toggle_tangent)
         QtGui.QShortcut(QtGui.QKeySequence("G"), self).activated.connect(
             self._toggle_cube_follows_ghost)
+        QtGui.QShortcut(QtGui.QKeySequence("E"), self).activated.connect(
+            self._toggle_grade_strip)
         # User pause toggle: pauses video AND ghost (gap preserved on resume).
         QtGui.QShortcut(QtGui.QKeySequence("Space"), self).activated.connect(
             self._toggle_user_pause)
@@ -2820,6 +3059,13 @@ class MainWindow(QtWidgets.QMainWindow):
         with self.state.lock:
             self.state.tangent_visible = not self.state.tangent_visible
             self.state._tune_message   = f"Tangent: {'ON' if self.state.tangent_visible else 'OFF'}"
+            self.state._tune_message_t = time.monotonic()
+
+    def _toggle_grade_strip(self):
+        with self.state.lock:
+            self.state.grade_strip_visible = not self.state.grade_strip_visible
+            on = self.state.grade_strip_visible
+            self.state._tune_message   = f"Grade strip: {'ON' if on else 'OFF'}"
             self.state._tune_message_t = time.monotonic()
 
     def _toggle_cube_follows_ghost(self):
@@ -4251,6 +4497,7 @@ def main():
     state.route_lat_arr  = _lat_arr
     state.route_lon_arr  = _lon_arr
     state.route_dist_arr = _np.asarray(dist_m, dtype=float)
+    state.route_elev_arr = _np.asarray(elev_m, dtype=float)
     # Restore persisted pacer cube tunes (cube-overlay branch)
     state.video_fov_h_deg  = float(last.get("video_fov_h_deg",  state.video_fov_h_deg))
     state.pacer_gap_m      = float(last.get("pacer_gap_m",      state.pacer_gap_m))
@@ -4259,6 +4506,9 @@ def main():
     state.tangent_visible  = bool(last.get("tangent_visible",   state.tangent_visible))
     state.cube_follows_ghost = bool(last.get("cube_follows_ghost",
                                              state.cube_follows_ghost))
+    state.grade_strip_visible = bool(last.get("grade_strip_visible",
+                                              state.grade_strip_visible))
+    state.body_weight_kg = float(last.get("body_weight_kg", state.body_weight_kg))
     signals                = WorkerSignals()
 
     # ── Activity recording ──
@@ -4306,6 +4556,8 @@ def main():
         runtime["camera_height_m"]         = state.camera_height_m
         runtime["tangent_visible"]         = state.tangent_visible
         runtime["cube_follows_ghost"]      = state.cube_follows_ghost
+        runtime["grade_strip_visible"]     = state.grade_strip_visible
+        runtime["body_weight_kg"]          = state.body_weight_kg
         save_settings(runtime)
     except Exception:
         pass
