@@ -868,6 +868,10 @@ class SharedState:
         # ~0.5° med within r<0.45 of half-width). Player's POLY projection diverges
         # past r≈0.45, so cube/tangent geometry should stay near the optical axis.
         self.video_fov_h_deg   = 118.8
+        # Lens law of the loaded footage: "pinhole" (rectilinear) or "stereographic".
+        # Default pinhole = exactly today's behaviour for existing GoPro-Player exports.
+        # Clips from tools/reframe.py --proj sg need "stereographic" (and FOV = its --fov).
+        self.video_projection  = "pinhole"
         self._tune_message     = ""     # transient HUD readout after a hotkey adjust
         self._tune_message_t   = 0.0    # time.monotonic() of last update
 
@@ -1678,6 +1682,7 @@ class OverlayWidget(QtWidgets.QWidget):
                 "route_elev":      self.state.route_elev_arr,
                 "grade_strip":     self.state.grade_strip_visible,
                 "fov_h_deg":       self.state.video_fov_h_deg,
+                "projection":      self.state.video_projection,
                 "tune_msg":        self.state._tune_message,
                 "tune_t":          self.state._tune_message_t,
                 "video_t":         self.state.video_t,
@@ -1990,14 +1995,32 @@ class OverlayWidget(QtWidgets.QWidget):
     PACER_COLOR   = QtGui.QColor(0, 229, 255, 220)
     TANGENT_COLOR = QtGui.QColor(255, 80,  80, 230)
 
-    def _project(self, x, y, z, w, h, fov_h_deg):
-        """Pinhole projection. Returns (u, v, behind)."""
+    def _project(self, x, y, z, w, h, fov_h_deg, proj="pinhole"):
+        """Project a camera-space point to pixels. Returns (u, v, behind).
+
+        The lens law has to match the FOOTAGE, not just its FOV. A rectilinear
+        reframe maps r = f·tan(θ); a stereographic one maps r = 2f·tan(θ/2).
+        At 130° those disagree by up to 177 px on a 1920-wide frame, so using the
+        wrong law walks the cube off the road as it moves off-axis — it is not a
+        small correction. `tools/reframe.py` now emits stereographic by default,
+        and GoPro Player's own "GoPro lens" is stereographic too (measured:
+        sg @ h_fov 158 plus a ~1% radial tweak we deliberately ignore).
+
+        "pinhole" reproduces the original formula exactly (verified to 1e-13 px),
+        so it remains the default and nothing changes for existing footage.
+        """
         if z >= -0.01:
             return 0.0, 0.0, True
-        f_px = (w / 2.0) / math.tan(math.radians(fov_h_deg) / 2.0)
-        u = w / 2.0 + f_px * (x / -z)
-        v = h / 2.0 - f_px * (y / -z)
-        return u, v, False
+        rho = math.hypot(x, y)
+        if rho < 1e-9:
+            return w / 2.0, h / 2.0, False
+        half  = math.radians(fov_h_deg) / 2.0
+        theta = math.atan2(rho, -z)
+        if proj == "stereographic":
+            r = (w / 2.0) * math.tan(theta / 2.0) / math.tan(half / 2.0)
+        else:
+            r = (w / 2.0) * math.tan(theta) / math.tan(half)
+        return w / 2.0 + r * (x / rho), h / 2.0 - r * (y / rho), False
 
     def _draw_cube(self, p, w, h, snap):
         gap   = snap["pacer_gap_m"]
@@ -2014,6 +2037,7 @@ class OverlayWidget(QtWidgets.QWidget):
         cam_h = snap["camera_height_m"]
         cy    = -cam_h + size / 2.0 + snap["pacer_height_m"]
         fov   = snap["fov_h_deg"]
+        proj  = snap.get("projection", "pinhole")
         if gap < 0.5:
             return
         s = size / 2.0
@@ -2025,7 +2049,7 @@ class OverlayWidget(QtWidgets.QWidget):
                     verts.append((cx + dx, cy + dy, cz + dz))
         edges = [(0,1),(0,2),(0,4),(1,3),(1,5),(2,3),(2,6),(3,7),
                  (4,5),(4,6),(5,7),(6,7)]
-        pts = [self._project(vx, vy, vz, w, h, fov) for (vx, vy, vz) in verts]
+        pts = [self._project(vx, vy, vz, w, h, fov, proj) for (vx, vy, vz) in verts]
         if all(b for *_, b in pts):
             return
         pen = QtGui.QPen(self.PACER_COLOR, 2.0)
@@ -2084,6 +2108,7 @@ class OverlayWidget(QtWidgets.QWidget):
         video stream is forward-stabilized (e.g. GoPro Player export).
         """
         fov   = snap["fov_h_deg"]
+        proj  = snap.get("projection", "pinhole")
         cam_h = snap["camera_height_m"]
         y     = -cam_h
         s_world = float(snap.get("dist") or 0.0)
@@ -2096,7 +2121,7 @@ class OverlayWidget(QtWidgets.QWidget):
         # Static perpendicular ticks at fixed camera-relative depths — a depth
         # ruler that stays put while the dashes flow past.
         def proj_camera(wx, wz):
-            return self._project(wx, y, wz, w, h, fov)
+            return self._project(wx, y, wz, w, h, fov, proj)
 
         tick_half = 0.5
         for dist in (5, 10, 15, 20, 30, 50):
@@ -2184,8 +2209,8 @@ class OverlayWidget(QtWidgets.QWidget):
                 continue
             ux, uz = xz_a
             vx, vz = xz_b
-            u0, v0, b0 = self._project(ux, y, uz, w, h, fov)
-            u1, v1, b1 = self._project(vx, y, vz, w, h, fov)
+            u0, v0, b0 = self._project(ux, y, uz, w, h, fov, proj)
+            u1, v1, b1 = self._project(vx, y, vz, w, h, fov, proj)
             if not (b0 or b1):
                 p.drawLine(QtCore.QPointF(u0, v0), QtCore.QPointF(u1, v1))
             d_local += period
@@ -2997,6 +3022,10 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self._tune_pacer("gap", -0.5))
         QtGui.QShortcut(QtGui.QKeySequence("'"), self).activated.connect(
             lambda: self._tune_pacer("gap", +0.5))
+        # Lens law of the footage. Same hotkey+persist pattern as FOV above — these
+        # pacer tunes have never had a settings-dialog control.
+        QtGui.QShortcut(QtGui.QKeySequence("Shift+L"), self).activated.connect(
+            lambda: self._tune_pacer("proj", 0.0))
         QtGui.QShortcut(QtGui.QKeySequence("C"), self).activated.connect(
             self._toggle_pacer)
         QtGui.QShortcut(QtGui.QKeySequence("R"), self).activated.connect(
@@ -3034,6 +3063,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 v = clamp(self.state.pacer_gap_m + delta, 0.5, 100.0)
                 self.state.pacer_gap_m = v
                 msg = f"Gap: {v:.1f} m"
+            elif axis == "proj":
+                # Toggle pinhole <-> stereographic. Must match how the clip was
+                # reframed: tools/reframe.py --proj sg -> stereographic; a GoPro
+                # Player export is stereographic too; anything rectilinear -> pinhole.
+                p = ("stereographic" if self.state.video_projection == "pinhole"
+                     else "pinhole")
+                self.state.video_projection = p
+                msg = f"Lens: {p}"
             else:
                 return
             self.state._tune_message   = msg
@@ -4500,6 +4537,7 @@ def main():
     state.route_elev_arr = _np.asarray(elev_m, dtype=float)
     # Restore persisted pacer cube tunes (cube-overlay branch)
     state.video_fov_h_deg  = float(last.get("video_fov_h_deg",  state.video_fov_h_deg))
+    state.video_projection = str(last.get("video_projection",   state.video_projection))
     state.pacer_gap_m      = float(last.get("pacer_gap_m",      state.pacer_gap_m))
     state.pacer_visible    = bool(last.get("pacer_visible",     state.pacer_visible))
     state.camera_height_m  = float(last.get("camera_height_m",  state.camera_height_m))
@@ -4551,6 +4589,7 @@ def main():
     try:
         runtime = load_settings()
         runtime["video_fov_h_deg"]         = state.video_fov_h_deg
+        runtime["video_projection"]        = state.video_projection
         runtime["pacer_gap_m"]             = state.pacer_gap_m
         runtime["pacer_visible"]           = state.pacer_visible
         runtime["camera_height_m"]         = state.camera_height_m
