@@ -3960,6 +3960,49 @@ class StartupDialog(QtWidgets.QDialog):
         fp_row.addWidget(self.peloton_free_cb)
         fp_row.addStretch()
         pel_v.addLayout(fp_row)
+        # Starting position: how much of the field is AHEAD of you at the gun.
+        # 0% = you lead the bunch, 100% = you sit on the very back. Continuous rather
+        # than a list of places, because the field is a body of riders shifted fore/aft
+        # as one — riders sit side by side in lanes, so "5th of 12" would be a fiction.
+        # → RIDESIM_PELOTON_START; the world biases every rider's station by it.
+        sp_row = QtWidgets.QHBoxLayout()
+        sp_row.setContentsMargins(0, 0, 0, 0)
+        sp_row.addSpacing(90)
+        sp_lbl = QtWidgets.QLabel("Starting position:")
+        self.peloton_start = QtWidgets.QSlider(Qt.Horizontal)
+        self.peloton_start.setRange(0, 100)
+        self.peloton_start.setValue(
+            int(round(float(self._last.get("peloton_start", 0.35)) * 100)))
+        self.peloton_start.setFixedWidth(170)
+        self.peloton_start.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.peloton_start.setTickInterval(25)
+        self.peloton_start_lbl = QtWidgets.QLabel()
+        self.peloton_start_lbl.setMinimumWidth(210)
+        self.peloton_start_lbl.setStyleSheet("color:#555;")
+
+        def _start_text(v: int) -> str:
+            name = ("Front of the bunch" if v < 10 else
+                    "Near the front" if v < 40 else
+                    "Mid-pack" if v < 62 else
+                    "Near the back" if v < 90 else
+                    "On the back")
+            return f"{name} — {v}% of the field ahead"
+
+        self.peloton_start.valueChanged.connect(
+            lambda v: self.peloton_start_lbl.setText(_start_text(v)))
+        self.peloton_start_lbl.setText(_start_text(self.peloton_start.value()))
+        for _w in (sp_lbl, self.peloton_start, self.peloton_start_lbl):
+            _w.setEnabled(_pel_on)
+            self.peloton_cb.toggled.connect(_w.setEnabled)
+        self.peloton_start.setToolTip(
+            "Where you sit in the bunch at the start. Left = you lead it (everyone "
+            "behind you); right = you sit on the back and everyone is up the road.\n"
+            "The pack still surges around you, so you move through the field as you ride.")
+        sp_row.addWidget(sp_lbl)
+        sp_row.addWidget(self.peloton_start)
+        sp_row.addWidget(self.peloton_start_lbl)
+        sp_row.addStretch()
+        pel_v.addLayout(sp_row)
         self._peloton_row = pel_w
         lay.addWidget(pel_w)
 
@@ -4273,6 +4316,7 @@ class StartupDialog(QtWidgets.QDialog):
                            if (virtual and self.peloton_cb.isChecked()) else 0),
             "peloton_level": self._peloton_levels[self.peloton_level.currentIndex()][1],
             "peloton_free": self.peloton_free_cb.isChecked(),
+            "peloton_start": self.peloton_start.value() / 100.0,
             "world_quality": self._world_qualities[self.world_quality.currentIndex()][1],
         }
         self.accept()
@@ -4369,7 +4413,8 @@ def place_main_window(win, screen):
 
 def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None,
                           peloton_n: int = 0, peloton_level: str = "",
-                          peloton_free: bool = False, world_quality: str = ""):
+                          peloton_free: bool = False, peloton_start: float = 0.35,
+                          world_quality: str = ""):
     """
     Launch the exported RideSimWorld renderer for a virtual ride and point it at
     the baked world via the RIDESIM_WORLD_DIR env var (the renderer reads its data
@@ -4411,6 +4456,11 @@ def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None
         # Free pace: pack rides its own pace and drops you (env wins for dev).
         free_env = os.environ.get("RIDESIM_PELOTON_FREE", "").strip()
         env["RIDESIM_PELOTON_FREE"] = free_env if free_env else ("1" if peloton_free else "0")
+        # Starting place in the bunch: the fraction of the field AHEAD of you
+        # (0 = you lead it, 1 = you sit on the back). Env wins (dev/benchmark).
+        st_env = os.environ.get("RIDESIM_PELOTON_START", "").strip()
+        env["RIDESIM_PELOTON_START"] = st_env if st_env else \
+            f"{min(1.0, max(0.0, float(peloton_start))):.3f}"
     # World render-detail tier (low|medium|high) → RIDESIM_WORLD_QUALITY. Unset lets
     # the world use its own default. A terminal-set env var wins (dev/benchmark).
     q = (os.environ.get("RIDESIM_WORLD_QUALITY", "").strip()
@@ -4483,6 +4533,7 @@ def main():
         "peloton_n":  cfg.get("peloton_n", 0),
         "peloton_level": cfg.get("peloton_level", "cat3"),
         "peloton_free": cfg.get("peloton_free", False),
+        "peloton_start": cfg.get("peloton_start", 0.35),
         "world_quality": cfg.get("world_quality", "medium"),
     })
 
@@ -4526,6 +4577,7 @@ def main():
             world_screen_pos=world_pos, peloton_n=cfg.get("peloton_n", 0),
             peloton_level=cfg.get("peloton_level", ""),
             peloton_free=cfg.get("peloton_free", False),
+            peloton_start=cfg.get("peloton_start", 0.35),
             world_quality=cfg.get("world_quality", ""))
     # Stash route geometry for the curved-centerline tangent renderer. NaN-fill
     # missing lat/lon entries so downstream code can use np.isfinite() masks.
