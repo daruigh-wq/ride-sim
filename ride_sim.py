@@ -788,6 +788,10 @@ class SharedState:
         self.body_weight_kg       = 73.0
         # Virtual-rider target power (test mode only; see worker_vrider).
         self.vrider_watts         = 150.0
+        # Sweep: oscillate that target so the video-sync loop is driven through a
+        # RANGE of rates instead of parking at one. 0 s = hold steady.
+        self.vrider_sweep_s       = 0.0
+        self.vrider_sweep_frac    = 0.6    # +-60% of target
 
         # ── Sync state (worker → GUI) ──
         self.video_t              = 0.0
@@ -1447,6 +1451,19 @@ async def worker_vrider(state, signals, time_s, dist_m, elev_m):
         with state.lock:
             grade = state.grade_pct / 100.0
             power = state.vrider_watts
+            sweep_s = state.vrider_sweep_s
+            sweep_f = state.vrider_sweep_frac
+        # SWEEP. A steady rider on a flat route holds one speed, which parks the video
+        # controller at one rate and tests almost nothing -- this route climbs 1.36 m in
+        # 914 m, so grade will not vary it either. Oscillating the power drags the
+        # required rate (rider speed / recorded speed) up and down through its whole
+        # working range, including the 2x ceiling, which is where the interesting
+        # behaviour lives. Keyed on t_sim, not wall time, so the profile is REPEATABLE:
+        # the point of a test rig is that two runs can be compared.
+        # Sine rather than a square: a step would test the controller's recovery from a
+        # discontinuity that no rider can produce, and mask how it tracks one they can.
+        if sweep_s > 0.0:
+            power = max(0.0, power * (1.0 + sweep_f * math.sin(math.tau * t_sim / sweep_s)))
         # Newton, integrated forward. sin(atan(g)) rather than g itself: at the grades
         # a bike sees the difference is under 0.5%, but it costs nothing to be right.
         theta = math.atan(grade)
@@ -1468,8 +1485,11 @@ async def worker_vrider(state, signals, time_s, dist_m, elev_m):
         state.ble_status = "VIRTUAL RIDER"
         state.hr_status  = "SIM HR"
         state.user_paused = True
-        state.status = ("VIRTUAL RIDER — %.0f W, paused at the line; press Space to roll out"
-                        % state.vrider_watts)
+        _sw = ("" if state.vrider_sweep_s <= 0.0 else
+               " sweeping ±%.0f%% over %.0f s" % (state.vrider_sweep_frac * 100.0,
+                                                  state.vrider_sweep_s))
+        state.status = ("VIRTUAL RIDER — %.0f W%s, paused at the line; press Space to roll out"
+                        % (state.vrider_watts, _sw))
 
     await run_ride_loop(state, signals, time_s, dist_m, elev_m, get_telemetry)
 
@@ -4234,6 +4254,24 @@ class StartupDialog(QtWidgets.QDialog):
             "same 150 W will run away downhill and crawl up a climb.")
         row.addWidget(self._vw_lbl)
         row.addWidget(self.vrider_watts_spin)
+        self.vrider_sweep_cb = QtWidgets.QCheckBox("sweep over")
+        self.vrider_sweep_cb.setChecked(bool(self._last.get("vrider_sweep", False)))
+        self.vrider_sweep_cb.setToolTip(
+            "Oscillate the power ±60% instead of holding it steady, so the video-sync "
+            "loop is driven through its whole range of rates rather than parking at "
+            "one. On a flat route a steady rider holds one speed and tests almost "
+            "nothing.\n"
+            "Keyed on ride time, so two runs are directly comparable.")
+        self.vrider_sweep_s = QtWidgets.QSpinBox()
+        self.vrider_sweep_s.setRange(10, 600)
+        self.vrider_sweep_s.setSingleStep(10)
+        self.vrider_sweep_s.setSuffix(" s")
+        self.vrider_sweep_s.setValue(int(self._last.get("vrider_sweep_s", 60)))
+        self.vrider_sweep_s.setFixedWidth(80)
+        self.vrider_sweep_s.setEnabled(self.vrider_sweep_cb.isChecked())
+        self.vrider_sweep_cb.toggled.connect(self.vrider_sweep_s.setEnabled)
+        row.addWidget(self.vrider_sweep_cb)
+        row.addWidget(self.vrider_sweep_s)
         row.addStretch()
         lay.addLayout(row)
 
@@ -4250,8 +4288,9 @@ class StartupDialog(QtWidgets.QDialog):
         def _mode_changed(idx):
             self.record_cb.setChecked(idx == 0)  # ON for BLE, OFF for SIM
             # The watts box only means anything for the virtual rider.
-            self._vw_lbl.setVisible(idx == 2)
-            self.vrider_watts_spin.setVisible(idx == 2)
+            for w in (self._vw_lbl, self.vrider_watts_spin,
+                      self.vrider_sweep_cb, self.vrider_sweep_s):
+                w.setVisible(idx == 2)
         self.mode_combo.currentIndexChanged.connect(_mode_changed)
         _mode_changed(self.mode_combo.currentIndex())
 
@@ -4553,6 +4592,8 @@ class StartupDialog(QtWidgets.QDialog):
             "sim_mode":   self.mode_combo.currentIndex() >= 1,
             "vrider":     self.mode_combo.currentIndex() == 2,
             "vrider_watts": self.vrider_watts_spin.value(),
+            "vrider_sweep": self.vrider_sweep_cb.isChecked(),
+            "vrider_sweep_s": self.vrider_sweep_s.value(),
             "mode_idx":   self.mode_combo.currentIndex(),
             "ghost_tcx":  ghost,
             "record":     self.record_cb.isChecked(),
@@ -4812,6 +4853,8 @@ def main():
         "band_video": cfg.get("band_video", ""),
         "video_laps": cfg.get("video_laps", 1),
         "vrider_watts": cfg.get("vrider_watts", 150),
+        "vrider_sweep": cfg.get("vrider_sweep", False),
+        "vrider_sweep_s": cfg.get("vrider_sweep_s", 60),
         "world_quality": cfg.get("world_quality", "medium"),
     })
 
@@ -4881,6 +4924,8 @@ def main():
                                               state.grade_strip_visible))
     state.body_weight_kg = float(last.get("body_weight_kg", state.body_weight_kg))
     state.vrider_watts = float(cfg.get("vrider_watts", state.vrider_watts))
+    state.vrider_sweep_s = (float(cfg.get("vrider_sweep_s", 60))
+                            if cfg.get("vrider_sweep") else 0.0)
     signals                = WorkerSignals()
 
     # ── Activity recording ──
