@@ -786,6 +786,8 @@ class SharedState:
         # Rider body weight for W/kg (RIDER_MASS_KG includes the ~10 kg bike, so
         # W/kg needs a separate body-only figure). Persisted; settable in Settings.
         self.body_weight_kg       = 73.0
+        # Virtual-rider target power (test mode only; see worker_vrider).
+        self.vrider_watts         = 150.0
 
         # ── Sync state (worker → GUI) ──
         self.video_t              = 0.0
@@ -1405,6 +1407,73 @@ async def worker_sim(state, signals, time_s, dist_m, elev_m):
     await run_ride_loop(state, signals, time_s, dist_m, elev_m, get_telemetry)
 
 
+async def worker_vrider(state, signals, time_s, dist_m, elev_m):
+    """
+    A synthetic rider that the rest of ride_sim cannot tell from a real one.
+
+    WHY THIS IS NOT SIM MODE. SIM mode replays the TCX's own recorded speed, so the
+    "rider" is a playback head: it does not respond to grade, and pointing it at a
+    video ride tells you nothing about whether the sync loop works. This one holds a
+    target POWER and integrates Newton's second law against the grade the route is
+    feeding the trainer, so a descent genuinely accelerates it and a wall genuinely
+    stalls it -- which is the thing worth testing without getting on the bike.
+
+        F_drive  = P / v                    (what the legs put in)
+        F_resist = mg·sinθ + mg·Crr + ½ρ·CdA·v²
+        a        = (F_drive − F_resist) / m
+
+    It plugs into the SAME run_ride_loop as the BLE and SIM workers, so distance
+    integration, the UDP packet, recording, the HUD and the grade pipeline are all
+    exercised exactly as in a real ride. The only thing not tested is BLE itself.
+
+    P/v blows up as v→0, so the drive force is capped and the v in the denominator has
+    a floor. Both numbers matter and the first draft got them wrong:
+      - FORCE CAP 200 N is what a recreational rider puts down off the line (~2.4 m/s²
+        on the flat). At 400 N the synthetic rider did 0-30 km/h in under two seconds.
+      - V FLOOR 0.3 m/s, not 1.2. The floor bounds the drive force at P/floor, so a
+        1.2 m/s floor meant 100 W could muster only 83 N -- less than the 84 N needed
+        to hold a 10% grade -- and the rider sat at a dead stop on a climb it should
+        have crawled up at 4.3 km/h. A floor high enough to be comfortable is a floor
+        that quietly deletes the whole low-speed climbing regime.
+    """
+    v = 0.0
+    last = time.monotonic()
+
+    async def get_telemetry(t_sim, idx):
+        nonlocal v, last
+        now = time.monotonic()
+        dt = clamp(now - last, 0.0, 0.5)      # clamp: a stall must not integrate a leap
+        last = now
+        with state.lock:
+            grade = state.grade_pct / 100.0
+            power = state.vrider_watts
+        # Newton, integrated forward. sin(atan(g)) rather than g itself: at the grades
+        # a bike sees the difference is under 0.5%, but it costs nothing to be right.
+        theta = math.atan(grade)
+        f_resist = (RIDER_MASS_KG * GRAVITY * math.sin(theta)
+                    + RIDER_MASS_KG * GRAVITY * CRR * math.cos(theta)
+                    + 0.5 * RHO * CD_A * v * v)
+        f_drive = min(power / max(v, 0.3), 200.0) if power > 0.0 else 0.0
+        v = max(0.0, v + (f_drive - f_resist) / RIDER_MASS_KG * dt)
+        # Cadence follows speed through a plausible gear, and stops when the bike does.
+        cad = 0.0 if v < 0.5 else clamp(60.0 + v * 4.0, 60.0, 105.0)
+        # Report the power actually being delivered, not the target: below ~1.2 m/s the
+        # force cap is what is really driving, and a HUD that reads 150 W at 2 km/h is
+        # lying about the same thing the model is careful to get right.
+        pwr = f_drive * v if v > 0.5 else 0.0
+        return {"speed_mps": v, "power_w": pwr, "cadence_rpm": cad,
+                "hr_bpm": 60 + clamp(pwr / 4.0, 0, 110)}
+
+    with state.lock:
+        state.ble_status = "VIRTUAL RIDER"
+        state.hr_status  = "SIM HR"
+        state.user_paused = True
+        state.status = ("VIRTUAL RIDER — %.0f W, paused at the line; press Space to roll out"
+                        % state.vrider_watts)
+
+    await run_ride_loop(state, signals, time_s, dist_m, elev_m, get_telemetry)
+
+
 # ─────────────────────────────────────────────────────────────
 #  BLE HR worker
 # ─────────────────────────────────────────────────────────────
@@ -1516,8 +1585,11 @@ async def worker_ble(state, signals, time_s, dist_m, elev_m):
 #  Worker thread entry
 # ─────────────────────────────────────────────────────────────
 
-async def worker_main(state, signals, time_s, dist_m, elev_m, sim_mode: bool):
-    if sim_mode:
+async def worker_main(state, signals, time_s, dist_m, elev_m, sim_mode: bool,
+                      vrider: bool = False):
+    if vrider:
+        await worker_vrider(state, signals, time_s, dist_m, elev_m)
+    elif sim_mode:
         await worker_sim(state, signals, time_s, dist_m, elev_m)
     else:
         await asyncio.gather(
@@ -1525,9 +1597,10 @@ async def worker_main(state, signals, time_s, dist_m, elev_m, sim_mode: bool):
             worker_hr(state),
         )
 
-def start_worker_thread(state, signals, time_s, dist_m, elev_m, sim_mode: bool):
+def start_worker_thread(state, signals, time_s, dist_m, elev_m, sim_mode: bool,
+                        vrider: bool = False):
     def run():
-        asyncio.run(worker_main(state, signals, time_s, dist_m, elev_m, sim_mode))
+        asyncio.run(worker_main(state, signals, time_s, dist_m, elev_m, sim_mode, vrider))
     t = threading.Thread(target=run, daemon=True)
     t.start()
     return t
@@ -4134,9 +4207,33 @@ class StartupDialog(QtWidgets.QDialog):
         row.addSpacing(20)
         row.addWidget(QtWidgets.QLabel("Mode:"))
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["BLE FTMS (real trainer)", "SIM (no trainer)"])
+        self.mode_combo.addItems(["BLE FTMS (real trainer)", "SIM (no trainer)",
+                                  "Virtual rider (test the link)"])
         self.mode_combo.setCurrentIndex(self._last.get("mode_idx", 0))
+        self.mode_combo.setToolTip(
+            "BLE FTMS — a real trainer.\n"
+            "SIM — replays the TCX's own recorded speed (a playback head; it does not "
+            "respond to grade).\n"
+            "Virtual rider — a synthetic rider holding the watts below, integrated "
+            "against the route's grade, so it accelerates downhill and stalls on a "
+            "wall. Feeds the same pipeline a trainer does: use it to test the UDP "
+            "link, the video sync and the pack without getting on the bike.")
         row.addWidget(self.mode_combo)
+        # Target power for the virtual rider. Not a slider: the point of this mode is a
+        # REPEATABLE input, so it wants a number you can write down and dial back in.
+        self._vw_lbl = QtWidgets.QLabel("at")
+        self.vrider_watts_spin = QtWidgets.QSpinBox()
+        self.vrider_watts_spin.setRange(0, 600)
+        self.vrider_watts_spin.setSingleStep(10)
+        self.vrider_watts_spin.setSuffix(" W")
+        self.vrider_watts_spin.setValue(int(self._last.get("vrider_watts", 150)))
+        self.vrider_watts_spin.setFixedWidth(90)
+        self.vrider_watts_spin.setToolTip(
+            "Steady power the synthetic rider holds. Speed comes out of the physics, "
+            "not out of this number — on the flat 150 W is roughly 27 km/h, and the "
+            "same 150 W will run away downhill and crawl up a climb.")
+        row.addWidget(self._vw_lbl)
+        row.addWidget(self.vrider_watts_spin)
         row.addStretch()
         lay.addLayout(row)
 
@@ -4152,7 +4249,11 @@ class StartupDialog(QtWidgets.QDialog):
         # Auto-toggle record based on mode selection
         def _mode_changed(idx):
             self.record_cb.setChecked(idx == 0)  # ON for BLE, OFF for SIM
+            # The watts box only means anything for the virtual rider.
+            self._vw_lbl.setVisible(idx == 2)
+            self.vrider_watts_spin.setVisible(idx == 2)
         self.mode_combo.currentIndexChanged.connect(_mode_changed)
+        _mode_changed(self.mode_combo.currentIndex())
 
         brow = QtWidgets.QHBoxLayout()
         about = QtWidgets.QPushButton("About")
@@ -4447,7 +4548,11 @@ class StartupDialog(QtWidgets.QDialog):
             "world_app":  world_app,
             "world_data": "" if band_mode else world_data,
             "offset":     self.offset_spin.value(),
-            "sim_mode":   self.mode_combo.currentIndex() == 1,
+            # Both non-BLE modes are "sim" to everything that only cares whether a
+            # trainer is attached (badges, the send-grade toggle, the HUD).
+            "sim_mode":   self.mode_combo.currentIndex() >= 1,
+            "vrider":     self.mode_combo.currentIndex() == 2,
+            "vrider_watts": self.vrider_watts_spin.value(),
             "mode_idx":   self.mode_combo.currentIndex(),
             "ghost_tcx":  ghost,
             "record":     self.record_cb.isChecked(),
@@ -4706,6 +4811,7 @@ def main():
         "peloton_lanes": cfg.get("peloton_lanes", 0),
         "band_video": cfg.get("band_video", ""),
         "video_laps": cfg.get("video_laps", 1),
+        "vrider_watts": cfg.get("vrider_watts", 150),
         "world_quality": cfg.get("world_quality", "medium"),
     })
 
@@ -4774,6 +4880,7 @@ def main():
     state.grade_strip_visible = bool(last.get("grade_strip_visible",
                                               state.grade_strip_visible))
     state.body_weight_kg = float(last.get("body_weight_kg", state.body_weight_kg))
+    state.vrider_watts = float(cfg.get("vrider_watts", state.vrider_watts))
     signals                = WorkerSignals()
 
     # ── Activity recording ──
@@ -4796,7 +4903,8 @@ def main():
                   f"{g_dist_m[-1]/1000:.2f} km | {g_time_s[-1]/60:.1f} min")
         except Exception as e:
             print(f"Ghost TCX load failed: {e}")
-    start_worker_thread(state, signals, time_s, dist_m, elev_m, cfg["sim_mode"])
+    start_worker_thread(state, signals, time_s, dist_m, elev_m, cfg["sim_mode"],
+                        cfg.get("vrider", False))
     win = MainWindow(state, signals, lat, lon, cfg["sim_mode"], cfg["video"],
                      total_dist_m=dist_m[-1])
     if cfg.get("virtual"):
