@@ -3793,14 +3793,36 @@ class StartupDialog(QtWidgets.QDialog):
         wt_lbl.setFixedWidth(90)
         wt_row.addWidget(wt_lbl)
         self.world_combo = QtWidgets.QComboBox()
+        # Three rides, two renderers. "Video ride" plays your footage in ride_sim's own
+        # window. "Virtual world" builds the road from DEM+OSM. The third puts your
+        # footage INSIDE the Godot world as a stabilised band on a sphere, so the virtual
+        # pack rides on your own road — it needs a BAKED band (gopro_stabilize --band-out),
+        # not a raw clip, because the stabilisation is in the pixels.
         self.world_combo.addItems(["Video ride (your footage)",
-                                   "Virtual world (Godot)"])
+                                   "Virtual world (Godot)",
+                                   "Video ride + virtual pack (Godot)"])
         self.world_combo.setCurrentIndex(int(self._last.get("world_type", 0)))
         self.world_combo.currentIndexChanged.connect(self._update_world_mode)
         wt_row.addWidget(self.world_combo, 1)
         lay.addLayout(wt_row)
 
         lay.addWidget(self._file_row("TCX file:", "*.tcx", "tcx"))
+
+        # Baked band for the video-in-world ride. The .json sidecar beside it carries the
+        # route, the per-frame bearing and the capture geo-anchor, so this one file picks
+        # the road, the sun and the camera calibration all at once — there is no world
+        # folder to choose. The bake writes <name>.ogv, <name>.json and <name>.tcx
+        # together, so selecting the video fills the TCX in too.
+        self._band_row = self._file_row("Band video:", "*.ogv *.ogg", "band_video")
+        lay.addWidget(self._band_row)
+        self._band_hint = QtWidgets.QLabel(
+            "A BAKED band from gopro_stabilize --band-out (an .ogv beside its .json "
+            "sidecar) — not a raw clip: the stabilisation has to be in the pixels. "
+            "The route, sun and camera height all come from the sidecar.")
+        self._band_hint.setStyleSheet("color:#555; font-size:10px; margin-left:95px;")
+        self._band_hint.setWordWrap(True)
+        lay.addWidget(self._band_hint)
+        self._band_video_edit.textChanged.connect(self._on_band_changed)
 
         # Route preview thumbnail + world-match strip (see render_route_pixmap).
         prev_row = QtWidgets.QHBoxLayout()
@@ -4037,6 +4059,39 @@ class StartupDialog(QtWidgets.QDialog):
         self._peloton_row = pel_w
         lay.addWidget(pel_w)
 
+        # Laps, video-in-world only. The world wraps your odometer into a lap-local
+        # position and seeks the band back to the start at the join, so the cost of a lap
+        # is one ~130 ms hitch. It only LOOKS right on a closed loop: any route can be
+        # repeated, but a point-to-point one cuts from the finish back to the start line,
+        # in the footage and on the map. The world measures the finish-to-start gap at
+        # load and warns if it is over 25 m, so the honest check happens either way.
+        lap_w = QtWidgets.QWidget()
+        lap_row = QtWidgets.QHBoxLayout(lap_w)
+        lap_row.setContentsMargins(0, 0, 0, 0)
+        lap_lbl = QtWidgets.QLabel("Laps:")
+        lap_lbl.setFixedWidth(90)
+        self.laps_spin = QtWidgets.QSpinBox()
+        self.laps_spin.setRange(0, 99)
+        self.laps_spin.setSpecialValueText("Unlimited")     # 0
+        # NOT `or 1`: 0 is a legitimate value here (Unlimited), and `0 or 1` is 1 --
+        # the idiom silently turns the special value into the default.
+        self.laps_spin.setValue(max(int(self._last.get("video_laps", 1)), 0))
+        self.laps_spin.setFixedWidth(110)
+        self.laps_spin.setToolTip(
+            "How many times round the recorded route. 1 = ride it once and hold on the "
+            "last frame.\n"
+            "Only looks right on a CLOSED LOOP — a point-to-point route will cut from "
+            "the finish back to the start line at each lap. The world measures that gap "
+            "and warns you if it is large.")
+        lap_hint = QtWidgets.QLabel("circuit riding — use a route that returns to its start")
+        lap_hint.setStyleSheet("color:#555;")
+        lap_row.addWidget(lap_lbl)
+        lap_row.addWidget(self.laps_spin)
+        lap_row.addWidget(lap_hint)
+        lap_row.addStretch()
+        self._laps_row = lap_w
+        lay.addWidget(lap_w)
+
         # World render quality (Godot world rides only). The world otherwise defaults
         # to its heaviest tier ("high": native-res + 4x MSAA + tree shadows + 12km
         # draw), which can swamp a GPU at 4K. Expose a per-ride picker that trades
@@ -4128,17 +4183,43 @@ class StartupDialog(QtWidgets.QDialog):
             self._world_app_row.setVisible(on)
 
     def _update_world_mode(self):
-        virtual = self.world_combo.currentIndex() == 1
-        self._video_row.setVisible(not virtual)
-        self._adv_row_w.setVisible(virtual)
-        self._world_app_row.setVisible(virtual and self._adv_btn.isChecked())
-        self._world_data_row.setVisible(virtual)
-        self._bake_row_w.setVisible(virtual)
-        self._virtual_hint.setVisible(virtual)
-        self._peloton_row.setVisible(virtual)   # peloton exists only in the Godot world
-        self._quality_row.setVisible(virtual)   # detail tier applies to the Godot world only
-        if virtual:
+        # Two things vary independently now: WHICH RENDERER (ride_sim's own window vs the
+        # Godot world) and, for the Godot world, WHERE THE SCENERY COMES FROM (a baked
+        # DEM+OSM world folder vs a baked video band). Keep them as separate booleans --
+        # collapsing them into one "virtual" flag is what would make the third mode
+        # awkward to add later.
+        idx = self.world_combo.currentIndex()
+        godot = idx >= 1                       # rendered by the Godot world
+        band = idx == 2                        # ...with your footage as the scenery
+        self._video_row.setVisible(idx == 0)
+        self._band_row.setVisible(band)
+        self._band_hint.setVisible(band)
+        self._adv_row_w.setVisible(godot)
+        self._world_app_row.setVisible(godot and self._adv_btn.isChecked())
+        # A video ride has no world folder: the route comes out of the band's sidecar.
+        self._world_data_row.setVisible(godot and not band)
+        self._bake_row_w.setVisible(godot and not band)
+        self._virtual_hint.setVisible(godot and not band)
+        self._peloton_row.setVisible(godot)     # the pack exists in both Godot modes
+        self._quality_row.setVisible(godot)     # ...as does the detail tier
+        self._laps_row.setVisible(band)         # laps only mean something on a video loop
+        if godot and not band:
             self._refresh_virtual_state()
+        self._update_preview()
+
+    def _on_band_changed(self, _t=None):
+        # The bake writes <name>.ogv, <name>.json and <name>.tcx side by side, so picking
+        # the video is enough to identify the ride. Fill the TCX from the sibling if the
+        # user has not chosen one that already exists — never overwrite a deliberate pick.
+        if self.world_combo.currentIndex() != 2:
+            return
+        band = self._band_video_edit.text().strip()
+        if not band:
+            return
+        sib = Path(band).with_suffix(".tcx")
+        cur = self._tcx_edit.text().strip()
+        if sib.exists() and (not cur or not Path(cur).exists()):
+            self._tcx_edit.setText(str(sib))
         self._update_preview()
 
     def _on_tcx_changed(self, _t=None):
@@ -4280,28 +4361,50 @@ class StartupDialog(QtWidgets.QDialog):
         return w
 
     def _accept(self):
-        virtual = self.world_combo.currentIndex() == 1
+        idx = self.world_combo.currentIndex()
+        band_mode = idx == 2
+        # `virtual` still means "the Godot world renders this ride", which is true of both
+        # Godot modes -- everything downstream (screen placement, launching the renderer,
+        # locking ride_sim's own video widget) keys off exactly that and needs no change.
+        virtual = idx >= 1
         tcx   = self._tcx_edit.text().strip()
         video = self._video_edit.text().strip()
+        band  = self._band_video_edit.text().strip() if band_mode else ""
         if not tcx or not Path(tcx).exists():
             QtWidgets.QMessageBox.warning(self, "Missing", "Please select a valid TCX file.")
             return
-        if not virtual and (not video or not Path(video).exists()):
+        if idx == 0 and (not video or not Path(video).exists()):
             QtWidgets.QMessageBox.warning(self, "Missing", "Please select a valid video file.")
             return
+        if band_mode:
+            if not band or not Path(band).exists():
+                QtWidgets.QMessageBox.warning(
+                    self, "Missing", "Please select a baked band video (.ogv).")
+                return
+            # The sidecar is the ride: route, per-frame bearing, sun, camera height. A
+            # band without one loads as a bare sphere with no road under it, so catch it
+            # here rather than letting the world fail with a push_error nobody sees.
+            side = Path(band).with_suffix(".json")
+            if not side.exists():
+                QtWidgets.QMessageBox.warning(
+                    self, "No sidecar",
+                    f"No sidecar found at:\n{side}\n\nA band needs the .json written "
+                    "beside it by gopro_stabilize --band-out. Without it there is no "
+                    "route, no camera bearing and no sun.")
+                return
         world_app  = self._world_app_edit.text().strip()
         world_data = self._world_data_edit.text().strip()
         if virtual and world_app and not Path(world_app).exists():
             QtWidgets.QMessageBox.warning(
                 self, "Missing", "World app not found — clear it or fix the path.")
             return
-        if virtual and world_data and not Path(world_data).exists():
+        if virtual and not band_mode and world_data and not Path(world_data).exists():
             QtWidgets.QMessageBox.warning(
                 self, "Missing", "World data folder not found — clear it or fix the path.")
             return
         # Safeguard: a world that doesn't cover this route means the rider and the
         # terrain won't line up. Warn (with the match score) rather than launch it.
-        if virtual and world_data and Path(world_data).exists():
+        if virtual and not band_mode and world_data and Path(world_data).exists():
             wb = world_route_bbox(world_data)
             if wb is not None and bbox_match(
                     _bbox_of(load_tcx_preview(tcx)[0]), wb) < WORLD_MATCH_MIN:
@@ -4317,7 +4420,8 @@ class StartupDialog(QtWidgets.QDialog):
                     return
         # Virtual ride with no world data and no bundled fallback → the renderer
         # would open empty. Confirm rather than silently launch a blank world.
-        if virtual and not world_data:
+        # A band ride has no world folder by design, so this never applies to it.
+        if virtual and not band_mode and not world_data:
             r = QtWidgets.QMessageBox.question(
                 self, "No world selected",
                 "No World data folder is set, so the renderer will open its empty "
@@ -4335,9 +4439,13 @@ class StartupDialog(QtWidgets.QDialog):
         self.result_data = {
             "tcx":        tcx,
             "video":      "" if virtual else video,
+            "mode_world_type": idx,          # remember which of the THREE ride types
             "virtual":    virtual,
+            "band_video": band,
+            # A band ride gets its scenery from the band, so never hand the renderer a
+            # world folder as well -- it would build DEM terrain behind the sphere.
             "world_app":  world_app,
-            "world_data": world_data,
+            "world_data": "" if band_mode else world_data,
             "offset":     self.offset_spin.value(),
             "sim_mode":   self.mode_combo.currentIndex() == 1,
             "mode_idx":   self.mode_combo.currentIndex(),
@@ -4349,6 +4457,7 @@ class StartupDialog(QtWidgets.QDialog):
             "peloton_free": self.peloton_free_cb.isChecked(),
             "peloton_start": self.peloton_start.value() / 100.0,
             "peloton_lanes": self.peloton_lanes.value(),
+            "video_laps": self.laps_spin.value() if band_mode else 1,
             "world_quality": self._world_qualities[self.world_quality.currentIndex()][1],
         }
         self.accept()
@@ -4446,7 +4555,8 @@ def place_main_window(win, screen):
 def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None,
                           peloton_n: int = 0, peloton_level: str = "",
                           peloton_free: bool = False, peloton_start: float = 0.35,
-                          peloton_lanes: int = 0, world_quality: str = ""):
+                          peloton_lanes: int = 0, world_quality: str = "",
+                          band_video: str = "", video_laps: int = 1):
     """
     Launch the exported RideSimWorld renderer for a virtual ride and point it at
     the baked world via the RIDESIM_WORLD_DIR env var (the renderer reads its data
@@ -4465,8 +4575,24 @@ def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None
               "yourself — UDP still drives it.")
         return None
     env = dict(os.environ)
+    # Tell the renderer it is being DRIVEN, not run by hand. It used to infer this from
+    # RIDESIM_WORLD_DIR or the screen hint, which both happen to be set for a DEM ride --
+    # but a band ride sets no world dir, and the screen hint only exists on a dual-monitor
+    # setup. On one monitor the renderer would have decided nobody was driving it and
+    # rolled away on its demo pace before ride_sim's first packet arrived.
+    env["RIDESIM_MANAGED"] = "1"
     if world_data:
         env["RIDESIM_WORLD_DIR"] = str(Path(world_data).resolve())
+    # VIDEO RIDE: your baked band becomes the scenery. The world reads the route, the
+    # per-frame camera bearing, the capture geo-anchor (for the sun) and the measured
+    # camera height from the .json sidecar beside it, so this single path replaces the
+    # whole world folder. RIDESIM_VIDEO_LAPS turns it into a circuit; the world checks
+    # the finish-to-start gap itself and warns when the route is not a loop.
+    # A terminal-set env var still wins, as with every other knob here.
+    if band_video:
+        env.setdefault("RIDESIM_VIDEO_BAND", str(Path(band_video).resolve()))
+        laps = os.environ.get("RIDESIM_VIDEO_LAPS", "").strip()
+        env["RIDESIM_VIDEO_LAPS"] = laps if laps else str(max(int(video_laps), 0))
     # Hint which monitor to fullscreen on: a global (x,y) point inside the target
     # screen. The renderer picks the screen containing it (Main.gd), so this is
     # robust to Qt/Godot screen-index ordering differing.
@@ -4510,6 +4636,9 @@ def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None
     try:
         proc = subprocess.Popen([str(binp)], env=env)
         extra = f"  RIDESIM_PELOTON_N={pelo}" if pelo else ""
+        if band_video:
+            extra += f"  RIDESIM_VIDEO_BAND={Path(band_video).name}" \
+                     f"  laps={env.get('RIDESIM_VIDEO_LAPS', '1')}"
         print(f"Launched world renderer: {binp}  RIDESIM_WORLD_DIR={env.get('RIDESIM_WORLD_DIR','(bundled)')}{extra}")
         return proc
     except Exception as e:
@@ -4567,7 +4696,7 @@ def main():
         "offset":     cfg["offset"],
         "mode_idx":   cfg["mode_idx"],
         "ghost_tcx":  cfg.get("ghost_tcx", ""),
-        "world_type": 1 if cfg.get("virtual") else 0,
+        "world_type": cfg.get("mode_world_type", 1 if cfg.get("virtual") else 0),
         "world_app":  cfg.get("world_app", ""),
         "world_data": cfg.get("world_data", ""),
         "peloton_n":  cfg.get("peloton_n", 0),
@@ -4575,6 +4704,8 @@ def main():
         "peloton_free": cfg.get("peloton_free", False),
         "peloton_start": cfg.get("peloton_start", 0.35),
         "peloton_lanes": cfg.get("peloton_lanes", 0),
+        "band_video": cfg.get("band_video", ""),
+        "video_laps": cfg.get("video_laps", 1),
         "world_quality": cfg.get("world_quality", "medium"),
     })
 
@@ -4620,7 +4751,9 @@ def main():
             peloton_free=cfg.get("peloton_free", False),
             peloton_start=cfg.get("peloton_start", 0.35),
             peloton_lanes=cfg.get("peloton_lanes", 0),
-            world_quality=cfg.get("world_quality", ""))
+            world_quality=cfg.get("world_quality", ""),
+            band_video=cfg.get("band_video", ""),
+            video_laps=cfg.get("video_laps", 1))
     # Stash route geometry for the curved-centerline tangent renderer. NaN-fill
     # missing lat/lon entries so downstream code can use np.isfinite() masks.
     _lat_arr = _np.asarray([(v if v is not None else math.nan) for v in lat], dtype=float)
