@@ -3960,6 +3960,37 @@ class StartupDialog(QtWidgets.QDialog):
         fp_row.addWidget(self.peloton_free_cb)
         fp_row.addStretch()
         pel_v.addLayout(fp_row)
+        # How many riders wide the pack rides → RIDESIM_PELOTON_LANES. The world's own
+        # "auto" answer fits as many lanes as the road is wide, which is right for a baked
+        # OSM world (the fan is centered on the road centerline) but wrong for a video
+        # ride: there the fan is centered on the line the camera actually rode, near the
+        # kerb, so a road-wide fan puts the outer riders on the verge. Auto = let the
+        # world decide (it narrows itself for video rides); pick a number to override.
+        ab_row = QtWidgets.QHBoxLayout()
+        ab_row.setContentsMargins(0, 0, 0, 0)
+        ab_row.addSpacing(90)
+        ab_lbl = QtWidgets.QLabel("Riders abreast:")
+        self.peloton_lanes = QtWidgets.QSpinBox()
+        self.peloton_lanes.setRange(0, 8)
+        self.peloton_lanes.setSpecialValueText("Auto")     # 0
+        self.peloton_lanes.setValue(int(self._last.get("peloton_lanes", 0) or 0))
+        self.peloton_lanes.setFixedWidth(90)
+        ab_hint = QtWidgets.QLabel("how wide the pack fans out (~1 m per rider)")
+        ab_hint.setStyleSheet("color:#555;")
+        for _w in (ab_lbl, self.peloton_lanes, ab_hint):
+            _w.setEnabled(_pel_on)
+            self.peloton_cb.toggled.connect(_w.setEnabled)
+        self.peloton_lanes.setToolTip(
+            "How many riders ride side by side. The pack strings out behind them, so "
+            "this trades width for length, not rider count.\n"
+            "Auto suits the road: a baked world fans across the carriageway, a video "
+            "ride keeps 3 abreast so nobody ends up on the verge of a narrow street.\n"
+            "Drop it on tight lanes; raise it on wide open roads.")
+        ab_row.addWidget(ab_lbl)
+        ab_row.addWidget(self.peloton_lanes)
+        ab_row.addWidget(ab_hint)
+        ab_row.addStretch()
+        pel_v.addLayout(ab_row)
         # Starting position: how much of the field is AHEAD of you at the gun.
         # 0% = you lead the bunch, 100% = you sit on the very back. Continuous rather
         # than a list of places, because the field is a body of riders shifted fore/aft
@@ -4317,6 +4348,7 @@ class StartupDialog(QtWidgets.QDialog):
             "peloton_level": self._peloton_levels[self.peloton_level.currentIndex()][1],
             "peloton_free": self.peloton_free_cb.isChecked(),
             "peloton_start": self.peloton_start.value() / 100.0,
+            "peloton_lanes": self.peloton_lanes.value(),
             "world_quality": self._world_qualities[self.world_quality.currentIndex()][1],
         }
         self.accept()
@@ -4414,7 +4446,7 @@ def place_main_window(win, screen):
 def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None,
                           peloton_n: int = 0, peloton_level: str = "",
                           peloton_free: bool = False, peloton_start: float = 0.35,
-                          world_quality: str = ""):
+                          peloton_lanes: int = 0, world_quality: str = ""):
     """
     Launch the exported RideSimWorld renderer for a virtual ride and point it at
     the baked world via the RIDESIM_WORLD_DIR env var (the renderer reads its data
@@ -4461,6 +4493,14 @@ def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None
         st_env = os.environ.get("RIDESIM_PELOTON_START", "").strip()
         env["RIDESIM_PELOTON_START"] = st_env if st_env else \
             f"{min(1.0, max(0.0, float(peloton_start))):.3f}"
+        # How many riders ride abreast. Only sent when the user picked a number: unset
+        # leaves the world on its own per-mode default (fit the road in a baked world,
+        # 3 abreast for a video ride), which is what "Auto" in the dialog means.
+        ln_env = os.environ.get("RIDESIM_PELOTON_LANES", "").strip()
+        if ln_env:
+            env["RIDESIM_PELOTON_LANES"] = ln_env
+        elif peloton_lanes and int(peloton_lanes) > 0:
+            env["RIDESIM_PELOTON_LANES"] = str(int(peloton_lanes))
     # World render-detail tier (low|medium|high) → RIDESIM_WORLD_QUALITY. Unset lets
     # the world use its own default. A terminal-set env var wins (dev/benchmark).
     q = (os.environ.get("RIDESIM_WORLD_QUALITY", "").strip()
@@ -4534,6 +4574,7 @@ def main():
         "peloton_level": cfg.get("peloton_level", "cat3"),
         "peloton_free": cfg.get("peloton_free", False),
         "peloton_start": cfg.get("peloton_start", 0.35),
+        "peloton_lanes": cfg.get("peloton_lanes", 0),
         "world_quality": cfg.get("world_quality", "medium"),
     })
 
@@ -4578,6 +4619,7 @@ def main():
             peloton_level=cfg.get("peloton_level", ""),
             peloton_free=cfg.get("peloton_free", False),
             peloton_start=cfg.get("peloton_start", 0.35),
+            peloton_lanes=cfg.get("peloton_lanes", 0),
             world_quality=cfg.get("world_quality", ""))
     # Stash route geometry for the curved-centerline tangent renderer. NaN-fill
     # missing lat/lon entries so downstream code can use np.isfinite() masks.
