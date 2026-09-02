@@ -135,7 +135,7 @@ APP_VERSION          = "0.1.0-beta"
 # disable the bundle after that date; leave as None during development. The
 # check is a courtesy reminder for testers to update — not a security
 # mechanism (any client-side check can be patched out).
-BETA_EXPIRES         = "2026-09-01"  # e.g. "2026-09-01"
+BETA_EXPIRES         = "2026-12-31"  # e.g. "2026-09-01"
 
 GATE_START_ON_SPEED  = True
 START_SPEED_KMH      = 2.0
@@ -4792,6 +4792,23 @@ def launch_world_renderer(world_app: str, world_data: str, world_screen_pos=None
         return None
 
 
+def msgbox(icon, title: str, text: str, parent=None):
+    """Modal message box that is safe to raise before any window exists.
+
+    The static helpers (QMessageBox.critical/warning/...) SEGFAULT on PySide6 6.11 /
+    Qt 6.11 on macOS when passed a None parent — the process dies with SIGSEGV instead
+    of showing the dialog, so the user sees a crash rather than the message. Building
+    the box and calling exec() on it is unaffected. Every call site that has a real
+    parent widget may keep using the static helpers; this is only for the parentless
+    ones during startup, before the main window is up.
+    """
+    box = QtWidgets.QMessageBox(parent)
+    box.setIcon(icon)
+    box.setWindowTitle(title)
+    box.setText(text)
+    return box.exec()
+
+
 def main():
     # Frozen tool-runner: the bake pipeline shells out to `sys.executable <tool>.py`,
     # but in a PyInstaller bundle sys.executable is this app, not a python. When
@@ -4817,12 +4834,14 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    if BETA_EXPIRES is not None:
+    # The expiry is a kill switch for DISTRIBUTED beta builds; running from source is
+    # the developer, so it must not self-destruct mid-development.
+    if BETA_EXPIRES is not None and getattr(sys, "frozen", False):
         try:
             expires = datetime.strptime(BETA_EXPIRES, "%Y-%m-%d").date()
             if datetime.now().date() > expires:
-                QtWidgets.QMessageBox.critical(
-                    None,
+                msgbox(
+                    QtWidgets.QMessageBox.Critical,
                     "Beta expired",
                     f"This beta build expired on {expires.isoformat()}.\n\n"
                     f"Please download the latest version.",
@@ -4861,7 +4880,7 @@ def main():
     try:
         time_s, dist_m, elev_m, lat, lon = load_tcx_route(cfg["tcx"])
     except Exception as e:
-        QtWidgets.QMessageBox.critical(None, "TCX Error", str(e))
+        msgbox(QtWidgets.QMessageBox.Critical, "TCX Error", str(e))
         return
 
     print(f"TCX: {len(time_s)} pts | {dist_m[-1]/1000:.2f} km | "
