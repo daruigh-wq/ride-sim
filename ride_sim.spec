@@ -27,6 +27,10 @@ else:
 
 datas = [
     (os.path.join(HERE, "THIRD_PARTY_LICENSES.txt"), "."),
+    # Leaflet is VENDORED, not pulled from a CDN — the maps are served over the
+    # app's private ridesim:// scheme so they work with no network. Without this
+    # line the frozen app has no Leaflet at all and every map renders blank.
+    (os.path.join(HERE, "assets", "leaflet"), "assets/leaflet"),
     (os.path.join(TOOLS, "bake_world.py"),      "tools"),
     (os.path.join(TOOLS, "route_to_world.py"),  "tools"),
     (os.path.join(TOOLS, "dem_to_heightmap.py"), "tools"),

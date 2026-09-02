@@ -122,6 +122,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6 import QtWebEngineCore
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 
@@ -225,26 +226,189 @@ HR_MEASUREMENT_UUID                = "00002a37-0000-1000-8000-00805f9b34fb"
 #  Leaflet map HTML  (dark CARTO tiles)
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+#  OFFLINE BASEMAP — cached OSM tiles served over a private URL scheme
+# ─────────────────────────────────────────────────────────────
+#
+# WHY. The maps used to pull tiles from CARTO's CDN, which in 2026-08 began
+# watermarking anonymous requests "API KEY REQUIRED" — so every shipped build's map
+# broke at once. Rather than swap one CDN for another and wait for the same thing to
+# happen again, the basemap is now OSM's own raster tiles, FETCHED ONCE PER ROUTE and
+# cached on disk. After the first ride over a route the map needs no network at all,
+# which is what an offline app should have been doing anyway.
+#
+# ⚠ OSM TILE POLICY. openstreetmap.org's tiles are donated infrastructure: a real
+# User-Agent is required and bulk downloading is not permitted. This stays inside the
+# policy because it fetches only the corridor of ONE route (a 40 km ride is ~200 tiles
+# at z16, about 4 MB), caches every byte, and never re-fetches. Do not widen this to
+# speculative area downloads.
+#
+# ⚠⚠ A BLOCKED TILE ARRIVES AS HTTP 200. When OSM refuses a request it does NOT send an
+# error status — it returns 200 with a PNG that READS "403 Access blocked". Caching that
+# poisons the cache permanently, and it looks like a map until you zoom in. The refusal
+# is identifiable from the headers instead: it carries `retry-after` and
+# `cache-control: no-cache`, where a real tile carries `etag`/`expires`/`age`.
+
+TILE_SCHEME     = "ridesim"
+TILE_HOST       = "map"
+TILE_SOURCE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+TILE_USER_AGENT = (f"ride-sim/{APP_VERSION} (personal cycling video project; "
+                   f"https://github.com/daruigh-wq/ride-sim)")
+# ⚠ KEEP THIS SHALLOW. Tile count roughly quadruples per zoom level: for the longest
+# route here, z12-15 is 185 tiles (~3.5 MB) but z12-17 is 816 (~15.6 MB), and fetching
+# ~800 tiles per route IS the bulk downloading the OSM policy prohibits. z12-15 covers
+# what the app actually shows — the HUD overlay cannot zoom at all, and the main map
+# opens fitted to the whole route. Zooming in past 15 still works: those tiles are
+# fetched on demand and cached, one at a time, as the user asks for them.
+TILE_PREFETCH_ZOOMS = (12, 13, 14, 15)
+
+
+def tiles_dir() -> Path:
+    """Shared with tools/osm_tiles.py — same dir, same {z}_{x}_{y}.png naming, so the
+    inspection tool and the app warm one cache instead of two nobody thinks to clear."""
+    return app_data_dir() / "osm_tiles"
+
+
+def _tile_response_is_real(headers) -> bool:
+    """False when OSM served its 'Access blocked' placeholder at HTTP 200."""
+    get = headers.get
+    if get("retry-after"):
+        return False
+    return "no-cache" not in (get("cache-control") or "").lower()
+
+
+def fetch_tile(z: int, x: int, y: int, timeout: float = 20.0) -> Optional[bytes]:
+    """One tile from the network, or None. Never raises — a missing basemap tile is a
+    cosmetic problem and must not take a ride down."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            TILE_SOURCE_URL.format(z=z, x=x, y=y),
+            headers={"User-Agent": TILE_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read()
+            if not _tile_response_is_real(r.headers):
+                print("[tiles] OSM refused the request (blocked placeholder) — "
+                      "not caching; check the User-Agent")
+                return None
+            return body
+    except Exception:
+        return None
+
+
+def cached_tile(z: int, x: int, y: int, fetch: bool = True) -> Optional[bytes]:
+    """Disk cache first, network second. Returns raw PNG bytes, or None."""
+    if not (0 <= z <= 22):
+        return None
+    n = 1 << z
+    if not (0 <= x < n and 0 <= y < n):
+        return None
+    d = tiles_dir()
+    p = d / f"{z}_{x}_{y}.png"
+    try:
+        if p.exists() and p.stat().st_size > 0:
+            return p.read_bytes()
+    except OSError:
+        pass
+    if not fetch:
+        return None
+    body = fetch_tile(z, x, y)
+    if body:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".part")
+            tmp.write_bytes(body)
+            tmp.replace(p)          # atomic: a killed app cannot leave a truncated tile
+        except OSError:
+            pass
+    return body
+
+
+def route_tile_ids(lat_list, lon_list, zooms=TILE_PREFETCH_ZOOMS, pad: int = 1):
+    """Tile ids covering the route corridor: every tile the track crosses, plus `pad`
+    rings so panning a little does not hit the network."""
+    ids = []
+    seen = set()
+    for z in zooms:
+        n = float(1 << z)
+        for la, lo in zip(lat_list, lon_list):
+            if la is None or lo is None:
+                continue
+            try:
+                rad = math.radians(la)
+                xt = int((lo + 180.0) / 360.0 * n)
+                yt = int((1.0 - math.asinh(math.tan(rad)) / math.pi) / 2.0 * n)
+            except (ValueError, OverflowError):
+                continue
+            for dx in range(-pad, pad + 1):
+                for dy in range(-pad, pad + 1):
+                    k = (z, xt + dx, yt + dy)
+                    if k not in seen:
+                        seen.add(k)
+                        ids.append(k)
+    return ids
+
+
+def prefetch_route_tiles(lat_list, lon_list, on_done=None):
+    """Warm the cache for one route on a background thread.
+
+    Deliberately SERIAL with a small delay: the OSM policy objects to parallel bulk
+    fetching, and there is no hurry — the map works from the network meanwhile and only
+    gets faster as this fills in.
+    """
+    ids = route_tile_ids(lat_list, lon_list)
+    missing = [(z, x, y) for (z, x, y) in ids
+               if not (tiles_dir() / f"{z}_{x}_{y}.png").exists()]
+    if not missing:
+        if on_done:
+            on_done(0, 0)
+        return None
+
+    def work():
+        got = 0
+        for i, (z, x, y) in enumerate(missing):
+            if cached_tile(z, x, y):
+                got += 1
+            else:
+                time.sleep(0.5)      # back off on failure rather than hammer
+            time.sleep(0.05)
+        print(f"[tiles] basemap cached: {got}/{len(missing)} new tiles "
+              f"({len(ids)} in route corridor)")
+        if on_done:
+            on_done(got, len(missing))
+
+    t = threading.Thread(target=work, name="tile-prefetch", daemon=True)
+    t.start()
+    return t
+
+
 LEAFLET_HTML = r"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
-  <style>html,body,#map{height:100%;margin:0;padding:0;background:#0d0d14;}</style>
-  <link rel="stylesheet"
-        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-        crossorigin=""/>
+  <style>html,body,#map{height:100%;margin:0;padding:0;background:#0d0d14;}
+    /* CARTO began watermarking anonymous basemap tiles "API KEY REQUIRED" (2026-08),
+       so the basemap is now OSM's own raster tiles, dimmed to sit in the dark UI.
+       ⚠ Do NOT use the usual invert(1) hue-rotate(180deg) dark-mode trick here: OSM
+       draws roads as WHITE fills, so inverting turns them black and they vanish into
+       the background. Dimming keeps roads lighter than the land, as the dark
+       basemap did.
+       ⚠ FILTER THE PANE, NOT THE TILE. leaflet.css declares `.leaflet-tile{filter:
+       inherit}` and it is linked AFTER this block, so an equal-specificity
+       `.leaflet-tile` rule here is silently reset and the map renders undimmed. That
+       `inherit` is deliberate — it exists so the filter can be set on the pane and
+       inherited by every tile. */
+    .leaflet-tile-pane{filter:brightness(0.35) saturate(0.65);}</style>
+  <link rel="stylesheet" href="/leaflet.css"/>
 </head>
 <body>
 <div id="map"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-        crossorigin=""></script>
+<script src="/leaflet.js"></script>
 <script>
   const route = ROUTE_POINTS;
   const map = L.map('map',{zoomControl:false});
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
-    maxZoom:19, attribution:'&copy; OpenStreetMap contributors &copy; CARTO'
+  L.tileLayer('/tile/{z}/{x}/{y}.png',{
+    maxZoom:19, attribution:'&copy; OpenStreetMap contributors'
   }).addTo(map);
   const full = L.polyline(route,{weight:3,color:'#444'}).addTo(map);
   map.fitBounds(full.getBounds(),{padding:[15,15]});
@@ -269,17 +433,15 @@ OVERLAY_MAP_HTML = r"""<!doctype html>
     html,body,#map{height:100%;width:100%;margin:0;padding:0;
                    background:#0d0d14;overflow:hidden;}
     .leaflet-control-attribution{display:none!important;}
+    /* see LEAFLET_HTML: dim (never invert — OSM's roads are white fills), and set it
+       on the PANE, because leaflet.css resets `.leaflet-tile` to filter:inherit */
+    .leaflet-tile-pane{filter:brightness(0.35) saturate(0.65);}
   </style>
-  <link rel="stylesheet"
-        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-        crossorigin=""/>
+  <link rel="stylesheet" href="/leaflet.css"/>
 </head>
 <body>
 <div id="map"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-        crossorigin=""></script>
+<script src="/leaflet.js"></script>
 <script>
   const route = ROUTE_POINTS;
   const map = L.map('map',{
@@ -292,7 +454,7 @@ OVERLAY_MAP_HTML = r"""<!doctype html>
     keyboard:false,
     touchZoom:false
   });
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
+  L.tileLayer('/tile/{z}/{x}/{y}.png',{
     maxZoom:19
   }).addTo(map);
   const full = L.polyline(route,{weight:3,color:'#444'}).addTo(map);
@@ -1918,14 +2080,16 @@ class OverlayWidget(QtWidgets.QWidget):
             p.setPen(QtGui.QPen(QtGui.QColor(100, 100, 100, 120), 1))
             p.setBrush(Qt.NoBrush)
             p.drawRect(mx, my, map_sz, map_sz)
-            # OSM/CARTO attribution — required by ODbL §4.3 and CARTO ToS.
-            # The Leaflet attribution control is suppressed on the overlay map
-            # (it would clash with the dark HUD), so render it here in HUD style.
+            # OSM attribution — required by ODbL §4.3. The Leaflet attribution control
+            # is suppressed on the overlay map (it would clash with the dark HUD), so
+            # render it here in HUD style. CARTO dropped 2026-09: their anonymous
+            # basemap tiles are now watermarked "API KEY REQUIRED", so the tiles come
+            # straight from OSM and crediting CARTO would be false.
             attr_font = QtGui.QFont(self.font())
             attr_font.setPointSize(8)
             p.setFont(attr_font)
             p.setPen(QtGui.QColor(200, 200, 200, 200))
-            p.drawText(mx + 4, my + map_sz - 4, "© OpenStreetMap contributors © CARTO")
+            p.drawText(mx + 4, my + map_sz - 4, "© OpenStreetMap contributors")
 
         # ── Tangent line + pacer cube ──
         # Draw the road-tangent reference first so the cube sits visually on top of it.
@@ -2502,6 +2666,83 @@ class VideoPanel(QtWidgets.QWidget):
 #  Map widget
 # ─────────────────────────────────────────────────────────────
 
+class RideSimSchemeHandler(QtWebEngineCore.QWebEngineUrlSchemeHandler):
+    """Serves ridesim://map/... — the vendored Leaflet and the cached basemap tiles.
+
+    A private scheme rather than a localhost HTTP server on purpose: no port to collide,
+    nothing listening on a socket, and the page is same-origin with its own assets.
+
+    ⚠ The scheme must be REGISTERED BEFORE THE QApplication IS CONSTRUCTED (see
+    register_ridesim_scheme); registering afterwards is ignored and every request 404s.
+    """
+
+    def requestStarted(self, job):
+        url = job.requestUrl()
+        path = url.path()
+        body, mime = None, b"application/octet-stream"
+
+        if path in ("/leaflet.js", "/leaflet.css"):
+            f = _here / "assets" / "leaflet" / path.lstrip("/")
+            try:
+                body = f.read_bytes()
+            except OSError:
+                body = None
+            mime = b"text/javascript" if path.endswith(".js") else b"text/css"
+        elif path.startswith("/tile/"):
+            try:
+                z, x, y = path[len("/tile/"):].removesuffix(".png").split("/")
+                # fetch=True: an uncached tile still loads (online), and caches itself,
+                # so the very first ride over a new route is not a blank map.
+                body = cached_tile(int(z), int(x), int(y), fetch=True)
+            except (ValueError, TypeError):
+                body = None
+            mime = b"image/png"
+
+        if not body:
+            job.fail(QtWebEngineCore.QWebEngineUrlRequestJob.UrlNotFound)
+            return
+        buf = QtCore.QBuffer(job)          # parented to the job so Qt owns the lifetime
+        buf.setData(QtCore.QByteArray(body))
+        buf.open(QtCore.QIODevice.ReadOnly)
+        job.reply(QtCore.QByteArray(mime), buf)
+
+
+_RIDESIM_SCHEME_READY = False
+
+
+def register_ridesim_scheme():
+    """Must run BEFORE QApplication() — Qt reads the scheme table at app construction."""
+    global _RIDESIM_SCHEME_READY
+    if _RIDESIM_SCHEME_READY:
+        return
+    s = QtWebEngineCore.QWebEngineUrlScheme(TILE_SCHEME.encode())
+    s.setSyntax(QtWebEngineCore.QWebEngineUrlScheme.Syntax.Host)
+    s.setFlags(QtWebEngineCore.QWebEngineUrlScheme.Flag.SecureScheme
+               | QtWebEngineCore.QWebEngineUrlScheme.Flag.LocalAccessAllowed
+               | QtWebEngineCore.QWebEngineUrlScheme.Flag.CorsEnabled)
+    QtWebEngineCore.QWebEngineUrlScheme.registerScheme(s)
+    _RIDESIM_SCHEME_READY = True
+
+
+_scheme_handler = None
+
+
+def install_ridesim_scheme_handler():
+    """Attach the handler to the default profile. Safe to call more than once; the
+    handler is kept in a module global because the profile does NOT take ownership and
+    a garbage-collected handler silently stops serving."""
+    global _scheme_handler
+    if _scheme_handler is not None:
+        return
+    _scheme_handler = RideSimSchemeHandler()
+    QtWebEngineCore.QWebEngineProfile.defaultProfile().installUrlSchemeHandler(
+        TILE_SCHEME.encode(), _scheme_handler)
+
+
+def _map_base_url() -> QtCore.QUrl:
+    return QtCore.QUrl(f"{TILE_SCHEME}://{TILE_HOST}/index.html")
+
+
 class MapWidget(QWebEngineView):
     def __init__(self, lat_list, lon_list):
         super().__init__()
@@ -2510,7 +2751,8 @@ class MapWidget(QWebEngineView):
         if len(route) < 2:
             raise RuntimeError("Not enough GPS points for map.")
         self._ready = False
-        self.setHtml(LEAFLET_HTML.replace("ROUTE_POINTS", str(route)))
+        self.setHtml(LEAFLET_HTML.replace("ROUTE_POINTS", str(route)),
+                     _map_base_url())
         self.loadFinished.connect(lambda ok: setattr(self, "_ready", bool(ok)))
 
     def set_position(self, lat, lon):
@@ -2550,7 +2792,8 @@ class OverlayMapWidget(QWebEngineView):
         # Position offscreen so it never flashes
         self.move(-sz - 100, -sz - 100)
         self.setHtml(
-            OVERLAY_MAP_HTML.replace("ROUTE_POINTS", self._route_json))
+            OVERLAY_MAP_HTML.replace("ROUTE_POINTS", self._route_json),
+            _map_base_url())
         self.loadFinished.connect(self._on_loaded)
         # Must be shown (even offscreen) for .grab() to render
         self.show()
@@ -4831,8 +5074,10 @@ def main():
         return
 
     QtWidgets.QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
+    register_ridesim_scheme()          # ⚠ must precede QApplication(), not follow it
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
+    install_ridesim_scheme_handler()
 
     # The expiry is a kill switch for DISTRIBUTED beta builds; running from source is
     # the developer, so it must not self-destruct mid-development.
@@ -4885,6 +5130,12 @@ def main():
 
     print(f"TCX: {len(time_s)} pts | {dist_m[-1]/1000:.2f} km | "
           f"{time_s[-1]/60:.1f} min | elev {min(elev_m):.0f}–{max(elev_m):.0f} m")
+
+    # Warm the basemap for THIS route in the background. After this completes once, the
+    # map for this route needs no network again. Harmless offline: it simply fails and
+    # the tiles stay uncached until a run that does have a connection.
+    if lat and lon:
+        prefetch_route_tiles(lat, lon)
 
     import numpy as _np
     state                  = SharedState()
