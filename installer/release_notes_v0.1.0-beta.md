@@ -13,28 +13,29 @@ ride that instead of a video — no footage required.
 
 ## Download
 
-Pick the installer for your OS from the **Assets** section below:
-
-| Platform | File |
+| Platform | How |
 |---|---|
-| Windows 10 / 11 (x64) | `Ride Sim-0.1.0-beta-windows-setup.exe` |
-| macOS 12+ (**Apple Silicon only**) | `Ride Sim-0.1.0-beta-mac.dmg` |
+| macOS 12+ (**Apple Silicon only**) | `Ride Sim-0.1.0-beta-mac.dmg` in **Assets** below |
+| Windows 10 / 11 (x64) | **Run from source** — see [README → Run from source](https://github.com/daruigh-wq/ride-sim#run-from-source) |
+
+> **No Windows installer at the moment.** The one originally attached to this
+> release shipped a build that has since expired, plus a basemap provider that
+> started demanding an API key — so it was withdrawn rather than left as a
+> trap. A rebuild will be attached here. Windows runs fine from source in the
+> meantime: `pip install PySide6 PySide6-Addons bleak`, then `python ride_sim.py`.
 
 > The macOS build is **Apple-Silicon-only** this round (M1 or later). An
 > Intel/universal mac build is planned for a later beta.
 
 ## Installing
 
-Both builds are **unsigned**, so the first launch triggers a security
-warning on both OSes. Full step-by-step (with the exact dialog text and
-buttons to click) is in [USAGE.md → Installing](../USAGE.md#installing).
-Short version:
-
-- **Windows:** SmartScreen → *More info* → *Run anyway*
-- **macOS:** drag **Ride Sim** to Applications, then double-click it. macOS blocks
-  it (*"Apple could not verify… is free of malware"*, **Move to Trash** / **Done**) —
-  click **Done**, then go to **System Settings → Privacy & Security → Open Anyway**
-  (needed once, because the app isn't notarized)
+The macOS build is **unsigned**, so the first launch triggers a security
+warning. Full step-by-step (with the exact dialog text and buttons to click)
+is in [USAGE.md → Installing](../USAGE.md#installing). Short version: drag
+**Ride Sim** to Applications, then double-click it. macOS blocks it (*"Apple
+could not verify… is free of malware"*, **Move to Trash** / **Done**) — click
+**Done**, then go to **System Settings → Privacy & Security → Open Anyway**
+(needed once, because the app isn't notarized).
 
 ## New in this build: ride a 3D virtual world
 
@@ -81,7 +82,8 @@ planned for v0.2.
   performance overlay
 - Configurable HUD pills: speed, cadence, power, HR, distance, elapsed,
   grade, gradient bar
-- Map overlay (off / minimap / minimap-tracking)
+- Map overlay (off / minimap / minimap-tracking), drawn from OpenStreetMap
+  tiles that are cached on first use — after that the map needs no network
 - Ghost rider from a prior TCX recording
 - AR pacer cube and road-tangent overlay (GoPro Max 2 calibration)
 - TCX recording for upload to Strava / Garmin Connect / etc.
@@ -112,10 +114,13 @@ planned for v0.2.
 
 ## Expiration
 
-This beta refuses to start after **2026-09-01**. Grab a newer build when
+This beta refuses to start after **2026-12-31**. Grab a newer build when
 prompted; this is a courtesy reminder, not DRM.
+
+(The mac build originally attached here expired on 2026-09-01 and has been
+replaced in place — re-download it if you grabbed it before 2026-09-02.)
 
 ---
 
-Built from `main` at commit `397b94a`. PyInstaller + PySide6; world renderer
+Built from `main` at commit `a7443c0`. PyInstaller + PySide6; world renderer
 built with Godot 4.6.

@@ -15,12 +15,12 @@ hit that haven't surfaced yet. Realistic risks:
 - **Your recorded TCX may have sync glitches** — gaps, bad pacing, or odd
   average speeds during periods where sync corrected aggressively.
   Spot-check the file before uploading to Strava / Garmin Connect.
-- **The installer is unsigned.** Windows SmartScreen and macOS Gatekeeper
-  will warn you the first time. The bypass steps below are normal beta
-  workflow, but you should also be the kind of person who only runs
-  unsigned software from sources they trust.
+- **The installer is unsigned.** macOS Gatekeeper will warn you the first
+  time. The bypass steps below are normal beta workflow, but you should
+  also be the kind of person who only runs unsigned software from sources
+  they trust.
 - **No automatic updates.** When a newer beta drops, you re-download.
-- **This build expires on 2026-09-01.** After that the app refuses to
+- **This build expires on 2026-12-31.** After that the app refuses to
   start until you grab a newer one. (This is a courtesy reminder, not
   DRM — it's there so testers don't keep running stale builds.)
 
@@ -57,10 +57,25 @@ previous TCX recording — and an AR **pacer cube** painted in the video.
 4. **Bluetooth permission prompt.** On first run, macOS asks for permission to use Bluetooth. **Allow it** — the app cannot find your trainer otherwise. If you refuse, you can re-enable it in **System Settings → Privacy & Security → Bluetooth**.
 
 ### Windows
-1. Run `Ride Sim-<version>-windows-setup.exe`.
-2. **First launch — SmartScreen warning.** Windows shows *"Windows protected your PC"* with a default **Don't run** button. Click the small **More info** link near the top of the dialog. The dialog will expand and reveal a **Run anyway** button — click it.
-3. Step through the installer (default install location is fine). When it finishes you'll have a **Ride Sim** entry in the Start Menu and (optionally) a desktop shortcut.
+
+**There is no Windows installer at the moment** — the previous one shipped an
+expired build and was withdrawn. A rebuild is coming. Until then, run the app
+from source; everything works the same, including BLE/FTMS.
+
+1. Install **Python 3.10+** from [python.org](https://www.python.org/downloads/windows/)
+   (tick *"Add python.exe to PATH"* in the installer).
+2. Download the source: on the [repo page](https://github.com/daruigh-wq/ride-sim)
+   click **Code → Download ZIP**, and unzip it. (Or `git clone` it if you have git.)
+3. Open **PowerShell** in that folder (Shift-right-click → *Open PowerShell window here*) and run:
+   ```
+   pip install PySide6 PySide6-Addons bleak
+   python ride_sim.py
+   ```
 4. Make sure Bluetooth is **on** in **Settings → Bluetooth & devices**.
+
+To also bake and ride **3D worlds**, add `pip install Pillow fitparse numpy` and
+put a checkout of [ride-sim-world](https://github.com/daruigh-wq/ride-sim-world)
+next to this folder. Video rides need nothing beyond step 3.
 
 ## Connecting to your trainer (BLE mode)
 
@@ -113,7 +128,7 @@ If video drifts visibly off telemetry: the in-ride **Video offset** spinner in t
 - **Avatar overlay** (cube, tangent line) is calibrated for **GoPro Max 2** 360 reframes. Other cameras play fine, but the cube alignment will be wrong.
 - **macOS audio stutter** in cruise mode when the playback rate steps. Workaround: use proportional mode, or mute audio.
 - **Slow-speed handlebar wobble** (sub-5 km/h) is a fundamental limit of bar-mounted footage — no telemetry correction can fully remove it.
-- **First-run permission prompts** on macOS (Bluetooth) and Windows (SmartScreen) are normal — beta builds aren't yet signed.
+- **First-run permission prompts** on macOS (Gatekeeper, then Bluetooth) are normal — beta builds aren't yet signed.
 
 ## Reporting bugs
 

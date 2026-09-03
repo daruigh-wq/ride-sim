@@ -21,16 +21,15 @@ from trainer telemetry. Pick per route by what you have and the mood you're in.
 
 ## Download
 
-Grab an installer — no Python needed:
-
-- **macOS (Apple Silicon):** [Ride Sim-0.1.0-beta-mac.dmg](https://github.com/daruigh-wq/ride-sim/releases/download/v0.1.0-beta/Ride.Sim-0.1.0-beta-mac.dmg)
-- **Windows 10/11 (x64):** [Ride Sim-0.1.0-beta-windows-setup.exe](https://github.com/daruigh-wq/ride-sim/releases/download/v0.1.0-beta/Ride.Sim-0.1.0-beta-windows-setup.exe)
+- **macOS (Apple Silicon):** [Ride Sim-0.1.0-beta-mac.dmg](https://github.com/daruigh-wq/ride-sim/releases/download/v0.1.0-beta/Ride.Sim-0.1.0-beta-mac.dmg) — an installer, no Python needed
+- **Windows 10/11 (x64):** [run from source](#run-from-source) for now — the
+  installer is being rebuilt and will reappear here when it lands
 - All releases: [github.com/daruigh-wq/ride-sim/releases](https://github.com/daruigh-wq/ride-sim/releases) · Project site: [davedesign.com](https://davedesign.com)
 
-**First launch** shows a security warning because the beta isn't code-signed yet:
-
-- **macOS** blocks it (*"Apple could not verify… is free of malware"*). Click **Done**, then **System Settings → Privacy & Security → Open Anyway**. One time only.
-- **Windows** SmartScreen shows *"Windows protected your PC"* → **More info** → **Run anyway**.
+**First launch** on macOS shows a security warning because the beta isn't
+code-signed yet: macOS blocks it (*"Apple could not verify… is free of
+malware"*). Click **Done**, then **System Settings → Privacy & Security →
+Open Anyway**. One time only.
 
 Full step-by-step with exact dialogs is in [USAGE.md → Installing](https://github.com/daruigh-wq/ride-sim/blob/main/USAGE.md#installing).
 
@@ -54,7 +53,8 @@ Don't have video of a route? Bake a world from it instead:
 
 The world renderer is a companion open-source project,
 [ride-sim-world](https://github.com/daruigh-wq/ride-sim-world) (Godot 4), bundled
-inside the installers — no separate download.
+inside the macOS installer — no separate download. From source, check it out
+beside this repo (see [Run from source](#run-from-source)).
 
 > Worlds are experimental: how much scenery you see depends on OpenStreetMap
 > coverage, so rural routes can look sparse.
@@ -104,7 +104,11 @@ python ride_sim.py
 Requirements: **Python 3.10+**, PySide6 (with PySide6-Addons for QtWebEngine),
 and bleak. (Baking worlds from source also needs `Pillow`, `fitparse`, `numpy`,
 and a checkout of [ride-sim-world](https://github.com/daruigh-wq/ride-sim-world)
-beside this one; the installers bundle all of that for you.)
+beside this one; the macOS installer bundles all of that for you.)
+
+This is the supported route on **Windows** until the installer is rebuilt — the
+same command works there, and Bluetooth/FTMS behaves identically. Video rides
+need nothing extra; for 3D-world rides add the bake dependencies above.
 
 A startup dialog lets you pick the TCX/video (or route file for a world), an
 optional ghost, video offset, mode (FTMS or SIM), world detail, and recording.
@@ -148,14 +152,17 @@ reader, not FFmpeg.
 
 ## Known issues
 
+- **No Windows installer right now** — it's mid-rebuild. Windows works fine
+  [from source](#run-from-source) in the meantime.
 - **macOS installer is Apple-Silicon-only** (M1 or later); Intel/universal is planned.
-- Both installers are **unsigned** → the one-time Gatekeeper / SmartScreen steps above.
+- The installer is **unsigned** → the one-time Gatekeeper step above.
 - **Worlds are experimental** — scenery density follows OpenStreetMap coverage, and a
   route that doubles back on itself can show a terrain seam where it overlaps.
 - **macOS audio stutter** when cruise mode steps the playback rate — use proportional mode, or mute.
 - **AR overlay** (cube, tangent line) is calibrated only for **GoPro Max 2** 360 reframes.
-- The **Leaflet map** needs an internet connection to load tiles.
-- This beta refuses to start after **2026-09-01** — grab a newer build when prompted.
+- The **map** fetches OpenStreetMap tiles the first time you ride a route, then
+  caches them — after that it works with no network.
+- This beta refuses to start after **2026-12-31** — grab a newer build when prompted.
 
 ## License
 
